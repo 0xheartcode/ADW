@@ -42,6 +42,16 @@ GATE_TAIL = 2000  # chars from the end (pytest's summary)
 AGENT_TIMEOUT = 900
 GATE_TIMEOUT = 600
 
+# Exit codes a wrapper (the butler bot) branches on. 0 = green the whole way;
+# EXIT_PARKED = the run stopped cleanly and is waiting for a human decision -
+# not a crash. Anything else is a usage/error exit. 75 is sysexits' EX_TEMPFAIL,
+# "temporary failure, try again later", which is exactly what a park is.
+EXIT_PARKED = 75
+
+
+def exit_code(state: dict) -> int:
+    return {"done": 0, "parked": EXIT_PARKED}.get(state["status"], 1)
+
 
 def load_dotenv(path: Path = Path(".env")) -> None:
     """Ten lines instead of python-dotenv, because the no-dependencies rule is
@@ -519,37 +529,37 @@ def run_gate(step: dict, state: dict, run_dir: Path, attempt: int):
     return passed, excerpt
 
 
-def run_human(state: dict, auto_approve: bool) -> bool:
+def run_human(state: dict, limits: dict) -> str:
     """The Approve / Reject node. This is what makes it supervised.
 
-    Diffs the whole run (base..HEAD), not HEAD~1: one attempt is rarely the
-    interesting unit, and HEAD~1 explodes on a repo with a single commit.
+    Returns "approve", "reject", or "park". Diffs the whole run (base..HEAD),
+    not HEAD~1: one attempt is rarely the interesting unit, and HEAD~1 explodes
+    on a repo with a single commit.
     """
     print("\n" + git(state["workspace"], "diff", "--stat", f"{state['base']}..HEAD"))
 
-    if auto_approve:
+    if limits["auto_approve"]:
         print("  [human] --auto-approve: accepted unreviewed")
-        return True
-    if not sys.stdin.isatty():
-        # Rejecting is the safe default. Silently reading 'y' off a pipe
-        # would turn the supervision gate into a rubber stamp, which is
-        # worse than stopping.
-        print("  [human] no terminal attached - cannot ask, so rejecting.")
-        print("          run it attached to a tty, pass --auto-approve, or:")
-        print(f"          adw.py resume runs/{state['run']} --from review")
-        return False
+        return "approve"
+    if limits["noninteractive"] or not sys.stdin.isatty():
+        # No human at the keyboard. Do NOT silently reject (that turns the
+        # supervision gate into a rubber stamp of "no") and do NOT block. Park:
+        # record the pending decision, exit clean, and let the butler notify a
+        # human who answers with `resume --approve` / `resume --reject`.
+        print("  [human] no terminal attached - parking for review.")
+        return "park"
 
     print("  [human] approve? (y = accept, n = reject, d = show full diff)")
     while True:
         try:
             answer = input("  > ").strip().lower()
         except EOFError:
-            print("\n  [human] stdin closed - rejecting.")
-            return False
+            print("\n  [human] stdin closed - parking for review.")
+            return "park"
         if answer == "d":
             print(git(state["workspace"], "diff", f"{state['base']}..HEAD"))
         elif answer in ("y", "n"):
-            return answer == "y"
+            return "approve" if answer == "y" else "reject"
 
 
 # ---------------------------------------------------------------------------
@@ -627,10 +637,14 @@ def orchestrate(state: dict, steps: list, run_dir: Path, limits: dict) -> dict:
                 transition(state, step["on_fail"], f"{step['name']} failed", run_dir)
 
         else:  # human
-            if run_human(state, limits["auto_approve"]):
+            decision = run_human(state, limits)
+            if decision == "approve":
                 _advance(state, step, order, run_dir)
-            else:
-                return _stop(state, run_dir, "rejected at review")
+            elif decision == "reject":
+                _reject(state, steps, run_dir, f"rejected at {step['name']}")
+            else:  # park - a human decides out-of-band
+                return _park(state, run_dir, f"awaiting review at '{step['name']}'",
+                             {"actions": ["approve", "reject"], "step": step["name"]})
 
     return state
 
@@ -649,13 +663,32 @@ def _advance(state, step, order, run_dir) -> None:
         print("\nDONE")
 
 
-def _stop(state, run_dir, why) -> dict:
-    state["status"] = "failed"
+def _park(state, run_dir, why, pending) -> dict:
+    """Every non-green ending lands here: a clean stop with a reason and the
+    concrete decision that would unblock it, recorded in state.json. The run is
+    resumable; the butler reads `stopped_because` + `pending` to ask a human."""
+    state["status"] = "parked"
     state["stopped_because"] = why
+    state["pending"] = pending
     state["ended_at"] = stamp()
     save_state(state, run_dir)
-    print(f"\nSTOPPED: {why}")
+    print(f"\nPARKED: {why}  (actions: {', '.join(pending['actions'])})")
     return state
+
+
+def _reject(state, steps, run_dir, reason) -> None:
+    """Route a rejection back to the first agent with the reason as feedback -
+    the very same mechanism a failing gate uses to make the agent try again."""
+    first_agent = next((s["name"] for s in steps if s["kind"] == "agent"), None)
+    state["feedback"] = reason
+    state["gate_hashes"] = {}
+    transition(state, first_agent, reason, run_dir)
+
+
+def _stop(state, run_dir, why) -> dict:
+    """A breaker/gate/worker stop. Unified with human parks: it is a park whose
+    actions are resume (try again) or reject (send it back with a reason)."""
+    return _park(state, run_dir, why, {"actions": ["resume", "reject"]})
 
 
 # ---------------------------------------------------------------------------
@@ -668,7 +701,8 @@ def cmd_list(_) -> int:
         return 0
     for line in INDEX.read_text().splitlines():
         r = json.loads(line)
-        mark = {"done": "ok  ", "failed": "FAIL"}.get(r["status"], "??  ")
+        mark = {"done": "ok  ", "failed": "FAIL",
+                "parked": "PARK"}.get(r["status"], "??  ")
         print(f"{mark} ${r['cost_usd']:>6.2f}  {r['run']:<44} {r['task'][:50]}")
     return 0
 
@@ -680,6 +714,8 @@ def cmd_show(args) -> int:
 
     print(f"task     {state['task']}")
     print(f"status   {state['status']}  {state.get('stopped_because', '')}")
+    if state.get("pending"):
+        print(f"pending  resume with: {' / '.join(state['pending'].get('actions', []))}")
     print(f"worker   {state['worker']}   workflow {state['workflow']}")
     print(f"cost     ${state['cost_usd']:.4f}")
     print(f"branch   {state.get('branch') or '-'}")
@@ -749,6 +785,9 @@ def _limits(args) -> dict:
         "max_wall": args.max_wall * 60,
         "max_attempt_cost": args.max_attempt_cost,
         "auto_approve": args.auto_approve,
+        # Park human gates instead of prompting, even with a tty attached. The
+        # butler drives runs this way so nothing ever blocks on stdin.
+        "noninteractive": getattr(args, "async_", False),
     }
 
 
@@ -795,7 +834,7 @@ def cmd_run(args) -> int:
     _index(state)
     drop_worktree(state, args.keep_worktree)
     print(f"\n${state['cost_usd']:.4f}   adw.py show {run_dir}")
-    return 0 if state["status"] == "done" else 1
+    return exit_code(state)
 
 
 def cmd_resume(args) -> int:
@@ -815,22 +854,37 @@ def cmd_resume(args) -> int:
             print(f"  - {e}")
         return 2
 
-    if args.from_step:
-        if args.from_step not in [s["name"] for s in steps]:
+    by = {s["name"]: s for s in steps}
+    order = [s["name"] for s in steps]
+    state["status"] = "running"
+    state.pop("stopped_because", None)
+    state.pop("pending", None)
+
+    if args.approve or args.reject:
+        # Answering a parked human review out-of-band (what the butler sends).
+        cur = state["step"]
+        if args.approve:
+            if by.get(cur, {}).get("kind") != "human":
+                print(f"--approve only applies at a human review step "
+                      f"(this run is parked at {cur!r})")
+                return 2
+            _advance(state, by[cur], order, run_dir)
+        else:  # --reject "<reason>": send it back to the agent with the reason
+            _reject(state, steps, run_dir, f"rejected: {args.reject}")
+    elif args.from_step:
+        if args.from_step not in order:
             print(f"no step named {args.from_step!r}")
             return 2
         state["step"] = args.from_step
         state["attempts"][args.from_step] = 0
         state["gate_hashes"] = {}
-    state["status"] = "running"
-    state.pop("stopped_because", None)
     save_state(state, run_dir)
 
     print(f"resuming at [{state['step']}] with ${state['cost_usd']:.4f} already spent")
     state = orchestrate(state, steps, run_dir, _limits(args))
     _index(state)
     drop_worktree(state, args.keep_worktree)
-    return 0 if state["status"] == "done" else 1
+    return exit_code(state)
 
 
 def _index(state: dict) -> None:
@@ -856,6 +910,9 @@ def main() -> int:
                        help="USD ceiling for a single agent attempt")
         p.add_argument("--auto-approve", action="store_true",
                        help="accept human gates unreviewed (unattended runs)")
+        p.add_argument("--async", dest="async_", action="store_true",
+                       help="never block on a human gate - park for out-of-band "
+                            "review (how the butler runs it)")
         p.add_argument("--keep-worktree", action="store_true",
                        help="keep the worktree checkout after a clean run")
 
@@ -872,6 +929,10 @@ def main() -> int:
     s = sub.add_parser("resume")
     s.add_argument("run")
     s.add_argument("--from", dest="from_step", help="rewind to this step first")
+    s.add_argument("--approve", action="store_true",
+                   help="approve a parked human review and continue")
+    s.add_argument("--reject", metavar="REASON",
+                   help="reject a parked review; REASON is fed back to the agent")
     budget(s)
     s.set_defaults(func=cmd_resume)
 
