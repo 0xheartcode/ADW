@@ -100,7 +100,10 @@ def scenario_crash_resume() -> bool:
     _git_init(repo)
     (repo / "seed.txt").write_text("seed\n")
     _commit(repo)
-    task = "crash-resume-proof"
+    # Unique task per invocation so the glob matches ONLY this run - an old
+    # crash-resume run dir (already parked at review) must not be latched onto
+    # before this run's dir exists.
+    task = f"crash-resume-proof-{int(time.time() * 1000)}"
     env = {**os.environ, "ADW_DEMO_SLEEP": "2"}   # widen the do-step window
     # Spawn in its own session so we can kill the whole process group hard.
     proc = subprocess.Popen(
