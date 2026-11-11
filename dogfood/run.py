@@ -298,6 +298,99 @@ def scenario_interview() -> bool:
     return ok
 
 
+FIX = ROOT / "dogfood" / "fixtures"
+
+
+def _gate_exit(argv, cwd, env=None):
+    return _sh(argv, cwd=cwd, env=env, timeout=90).returncode
+
+
+def scenario_deepgates() -> bool:
+    """#9: each deep gate PASSES on correct code and FAILS on broken (a gate that
+    cannot fail certifies nothing), and the tui/sim workflows run through ADW."""
+    _banner("deepgates")
+    results = {}
+    log = []
+
+    # -- logic gate (unittest) --
+    repo = _fresh("dg-logic")
+    _git_init(repo)
+    (repo / "adder.py").write_text("def add(a, b):\n    return a + b\n")
+    (repo / "test_adder.py").write_text(
+        "import unittest\nfrom adder import add\n"
+        "class T(unittest.TestCase):\n"
+        "    def test(self):\n        self.assertEqual(add(2, 3), 5)\n")
+    ok = _gate_exit([sys.executable, "-m", "unittest", "discover", "-s", str(repo)], repo)
+    # Break it. Different length + clear __pycache__ so Python can't reuse the
+    # stale (correct) bytecode when mtime-second and size happen to match.
+    (repo / "adder.py").write_text("def add(a, b):  # intentionally broken\n    return a - b\n")
+    shutil.rmtree(repo / "__pycache__", ignore_errors=True)
+    bad = _gate_exit([sys.executable, "-m", "unittest", "discover", "-s", str(repo)], repo)
+    results["logic"] = ok == 0 and bad != 0
+    log.append(f"logic: correct_exit={ok} broken_exit={bad}")
+
+    # -- tui gate (panedrive, our tool) --
+    if shutil.which("panedrive"):
+        ws = _fresh("dg-tui")
+        _git_init(ws)
+        shutil.copy(FIX / "tui" / "app.py", ws / "app.py")
+        shutil.copy(FIX / "tui" / "acceptance.pds", ws / "acceptance.pds")
+        gate = ["sh", "-c",
+                ('panedrive run "$PWD/acceptance.pds" --backend pty --state '
+                 '"$PWD/.adw-tui.state.json" -- python3 "$PWD/app.py" '
+                 '"$PWD/.adw-tui.state.json"')]
+        ok = _gate_exit(gate, ws)
+        bad = _gate_exit(gate, ws, env={**os.environ, "TUI_STEP": "2"})
+        results["tui-gate"] = ok == 0 and bad != 0
+        log.append(f"tui-gate: correct_exit={ok} broken_exit={bad}")
+
+        # tui WORKFLOW end-to-end through ADW (app pre-seeded correct).
+        wf = _fresh("dg-tui-wf")
+        _git_init(wf)
+        shutil.copy(FIX / "tui" / "app.py", wf / "app.py")
+        shutil.copy(FIX / "tui" / "acceptance.pds", wf / "acceptance.pds")
+        _commit(wf)
+        _sh([sys.executable, str(ADW), "run", "tuiwf", "--workflow", "tui",
+             "--worker", "demo", "--repo", str(wf), "--auto-approve"], cwd=ROOT)
+        st = json.loads((max(Path(ROOT, "runs").glob("*tuiwf*"),
+                             key=lambda p: p.stat().st_mtime) / "state.json").read_text())
+        results["tui-workflow"] = st["status"] == "done"
+        log.append(f"tui-workflow: status={st['status']}")
+    else:
+        log.append("tui: SKIP (panedrive not on PATH)")
+
+    # -- sim gate (simharness, our tool) --
+    if shutil.which("simharness"):
+        ws = _fresh("dg-sim")
+        shutil.copytree(FIX / "sim", ws, dirs_exist_ok=True)
+        _git_init(ws)
+        ok = _gate_exit(["simharness", "assert"], ws)
+        cfg = ws / "simharness.config.ts"
+        cfg.write_text(cfg.read_text().replace(
+            "r2.final.extra.kills > 0", "r2.final.extra.kills > 999999"))
+        bad = _gate_exit(["simharness", "assert"], ws)
+        results["sim-gate"] = ok == 0 and bad != 0
+        log.append(f"sim-gate: correct_exit={ok} broken_exit={bad}")
+
+        wf = _fresh("dg-sim-wf")
+        shutil.copytree(FIX / "sim", wf, dirs_exist_ok=True)
+        _git_init(wf)
+        _commit(wf)
+        _sh([sys.executable, str(ADW), "run", "simwf", "--workflow", "sim",
+             "--worker", "demo", "--repo", str(wf), "--auto-approve"], cwd=ROOT)
+        st = json.loads((max(Path(ROOT, "runs").glob("*simwf*"),
+                             key=lambda p: p.stat().st_mtime) / "state.json").read_text())
+        results["sim-workflow"] = st["status"] == "done"
+        log.append(f"sim-workflow: status={st['status']}")
+    else:
+        log.append("sim: SKIP (simharness not on PATH - build with 'make compile')")
+
+    _log("deepgates", "\n".join(log))
+    ok = all(results.values())
+    print(f"deepgates: {'OK' if ok else 'FAIL'}  {results}")
+    return ok
+
+
 def scenario_long() -> bool:
     """#6: the whole long workflow end-to-end, offline - interview (panedrive
     over a real PTY) -> plan/splice -> milestones -> review -> done."""
@@ -366,6 +459,7 @@ SCENARIOS = {
     "thrash": scenario_thrash,
     "interview": scenario_interview,
     "long": scenario_long,
+    "deepgates": scenario_deepgates,
 }
 
 
