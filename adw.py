@@ -1146,6 +1146,64 @@ def cmd_list(args) -> int:
     return 0
 
 
+def wall_seconds(state: dict) -> float:
+    """Wall-clock seconds between started_at and ended_at (or now)."""
+    try:
+        a = dt.datetime.fromisoformat(state["started_at"])
+        b = dt.datetime.fromisoformat(state.get("ended_at") or stamp())
+        return max(0.0, (b - a).total_seconds())
+    except (KeyError, ValueError):
+        return 0.0
+
+
+def cmd_summary(args) -> int:
+    """A one-screen run summary: status, usage, steps, park + resume, diff stat.
+    Distinct from the verbose `show`; built for a butler notification body."""
+    run_dir = Path(args.run)
+    state = migrate(json.loads((run_dir / "state.json").read_text()))
+    print(f"{state['status'].upper()}  {state['run']}")
+    print(f"  task     {state['task'][:70]}")
+    print(f"  flow     {state['workflow']} / {state['worker']}")
+    print(f"  usage    turns {state.get('turns', 0)}   "
+          f"cost ${state['cost_usd']:.4f}   wall {wall_seconds(state):.0f}s")
+    if state.get("attempts"):
+        print("  steps    " + "  ".join(f"{k}x{v}"
+                                        for k, v in state["attempts"].items()))
+    if state["status"] == "parked":
+        print(f"  parked   [{state.get('park_kind', '?')}] "
+              f"{state.get('stopped_because', '')}")
+        print(f"  resume   {resume_hint(run_dir, state.get('pending', {}))}")
+    stat = git(state["workspace"], "diff", "--stat",
+               f"{state.get('base', 'HEAD')}..HEAD").strip()
+    if stat:
+        print("  diff\n    " + stat.replace("\n", "\n    "))
+    return 0
+
+
+def cmd_usage(_) -> int:
+    """Aggregate usage across all runs: status/park-reason counts and total
+    turns - the plan-usage picture a subscription dollar figure cannot give."""
+    if not INDEX.exists():
+        print("no runs yet")
+        return 0
+    rows = [json.loads(line) for line in INDEX.read_text().splitlines() if line.strip()]
+    status, parks = {}, {}
+    turns = cost = 0
+    for r in rows:
+        status[r["status"]] = status.get(r["status"], 0) + 1
+        turns += r.get("turns", 0)
+        cost += r.get("cost_usd", 0)
+        if r.get("park_kind"):
+            parks[r["park_kind"]] = parks.get(r["park_kind"], 0) + 1
+    print(f"runs     {len(rows)}   "
+          + "  ".join(f"{k}={v}" for k, v in sorted(status.items())))
+    print(f"turns    {turns}   cost ${cost:.2f}")
+    if parks:
+        print("parks    " + "  ".join(f"{k}={v}" for k, v in
+                                      sorted(parks.items(), key=lambda kv: -kv[1])))
+    return 0
+
+
 def cmd_show(args) -> int:
     """Reconstruct a past run from what it left on disk."""
     run_dir = Path(args.run)
@@ -1156,7 +1214,10 @@ def cmd_show(args) -> int:
     if state.get("pending"):
         print(f"pending  resume with: {' / '.join(state['pending'].get('actions', []))}")
     print(f"worker   {state['worker']}   workflow {state['workflow']}")
-    print(f"cost     ${state['cost_usd']:.4f}")
+    # Under a subscription cost is unreliable, so turns + wall are the real
+    # usage signals; keep cost too for metered workers.
+    print(f"cost     ${state['cost_usd']:.4f}   turns {state.get('turns', 0)}"
+          f"   wall {wall_seconds(state):.0f}s")
     print(f"branch   {state.get('branch') or '-'}")
     print("attempts " + "  ".join(f"{k}={v}" for k, v in state["attempts"].items()))
     if state.get("stream_types"):
@@ -1418,6 +1479,12 @@ def main() -> int:
     w.add_argument("run")
     w.add_argument("--tools", action="store_true", help="include tool calls")
     w.set_defaults(func=cmd_show)
+
+    sm = sub.add_parser("summary")
+    sm.add_argument("run")
+    sm.set_defaults(func=cmd_summary)
+
+    sub.add_parser("usage").set_defaults(func=cmd_usage)
 
     lst = sub.add_parser("list")
     lst.add_argument("--park-kind", dest="park_kind",
