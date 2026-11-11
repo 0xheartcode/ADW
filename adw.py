@@ -401,6 +401,25 @@ def check_repo(path: Path) -> list:
     return []
 
 
+def detect_project_type(repo) -> str:
+    """Guess the best-matching ADW workflow for a repo by what's on disk.
+
+    Advisory only: it picks a sensible default workflow, but an explicit
+    --workflow always wins over whatever this returns. Ordered most-specific
+    first so a simharness or tui repo isn't mistaken for a plain feature one.
+    """
+    repo = Path(repo)
+    if (repo / "simharness.config.ts").exists():
+        return "sim"
+    if (repo / "app.py").exists() and any(repo.glob("*.pds")):
+        return "tui"
+    if (repo / "Cargo.toml").exists():
+        return "rust"
+    if any(repo.glob("test_*.py")) or any(repo.glob("*_test.py")):
+        return "feature"
+    return "chore"
+
+
 # ---------------------------------------------------------------------------
 # STATE
 # ---------------------------------------------------------------------------
@@ -1200,6 +1219,13 @@ def _stop(state, run_dir, why) -> dict:
 # INTROSPECTION
 # ---------------------------------------------------------------------------
 
+def cmd_detect(args) -> int:
+    """Print the workflow detect_project_type() would pick for a repo.
+    Advisory: `run` still honours an explicit --workflow over this guess."""
+    print(detect_project_type(args.repo))
+    return 0
+
+
 def cmd_list(args) -> int:
     if not INDEX.exists():
         print("no runs yet")
@@ -1561,6 +1587,11 @@ def main() -> int:
     sm.set_defaults(func=cmd_summary)
 
     sub.add_parser("usage").set_defaults(func=cmd_usage)
+
+    dt_ = sub.add_parser("detect")
+    dt_.add_argument("--repo", default=".", type=Path,
+                     help="repo to inspect (advisory workflow guess)")
+    dt_.set_defaults(func=cmd_detect)
 
     lst = sub.add_parser("list")
     lst.add_argument("--park-kind", dest="park_kind",
