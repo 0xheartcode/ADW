@@ -17,6 +17,7 @@ Zero third-party dependencies. Keep it that way as long as you can.
 """
 
 import argparse
+import copy
 import datetime as dt
 import hashlib
 import json
@@ -311,6 +312,11 @@ def migrate(state: dict) -> dict:
     state.setdefault("origin_repo", ws)
     state.setdefault("head", head(ws))
     state.setdefault("base", state["head"])
+    # The effective step list is the source of truth for resume. Older runs
+    # (and runs that never spliced) are backfilled from the static template, so
+    # a resume always has a list that contains state["step"] - including any
+    # steps a plan step spliced in (see expand_milestones / orchestrate).
+    state.setdefault("steps", copy.deepcopy(WORKFLOWS.get(state["workflow"], [])))
     return state
 
 
@@ -793,7 +799,9 @@ def _limits(args) -> dict:
 
 def cmd_run(args) -> int:
     repo = args.repo.expanduser().resolve()
-    steps = WORKFLOWS[args.workflow]
+    # Deep-copy the template so a plan step can splice into this run's list
+    # without mutating the module-level WORKFLOWS shared by other runs.
+    steps = copy.deepcopy(WORKFLOWS[args.workflow])
 
     errors = validate(steps, args.worker) + check_repo(repo)
     if errors:
@@ -826,6 +834,10 @@ def cmd_run(args) -> int:
         "gate_hashes": {}, "cost_usd": 0.0, "feedback": None, "stream_types": {},
         "started_at": stamp(),
         "history": [],
+        # The effective step list, persisted so a resumed run - including one a
+        # plan step has spliced new steps into - rebuilds by_name/order from
+        # this rather than the static template, and never KeyErrors on resume.
+        "steps": steps,
     }
     print(f"run: {run_dir}\nworkspace: {workspace}\nbase: {state['base']}")
     save_state(state, run_dir)
@@ -845,7 +857,9 @@ def cmd_resume(args) -> int:
     """
     run_dir = Path(args.run)
     state = migrate(json.loads((run_dir / "state.json").read_text()))
-    steps = WORKFLOWS[state["workflow"]]
+    # Resume from the persisted effective list, not the static template: this is
+    # what carries spliced plan steps across a kill/resume (see migrate()).
+    steps = state["steps"]
 
     errors = check_repo(Path(state["workspace"]))
     if errors:
