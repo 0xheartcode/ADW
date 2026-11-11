@@ -1,0 +1,6 @@
+# panedrive drives ADW itself (gli #11): watch ADW's own paneview seam and
+# assert it parks for review with the right pending decision. No keys needed -
+# ADW runs non-interactively; this verifies state, not input.
+wait-until status=parked --timeout-ms 10000
+assert step=review
+assert pending_actions=approve,reject

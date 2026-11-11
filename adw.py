@@ -409,10 +409,39 @@ def scrub(text: str) -> str:
     return text
 
 
+def write_seam(state: dict) -> None:
+    """Expose a paneview JSON state seam (scalar leaves only) so panedrive can
+    drive and assert ADW itself headlessly - the same deterministic verification
+    ADW gives every other TUI. A no-op unless $PANEDRIVE_STATE/$ADW_SEAM is set,
+    so normal runs pay nothing. Any error here must never break a run.
+    """
+    path = os.environ.get("ADW_SEAM") or os.environ.get("PANEDRIVE_STATE")
+    if not path:
+        return
+    pending = state.get("pending") or {}
+    seam = {
+        "status": state.get("status", ""),
+        "step": state.get("step", ""),
+        "cost_usd": state.get("cost_usd", 0.0),
+        "turns": state.get("turns", 0),
+        "stopped_because": state.get("stopped_because", ""),
+        # kept scalar (comma-joined) so the seam is a flat object of scalars.
+        "pending_actions": ",".join(pending.get("actions", [])),
+    }
+    try:
+        p = Path(path)
+        tmp = p.with_name(p.name + ".tmp")
+        tmp.write_text(json.dumps(seam))
+        os.replace(tmp, p)                   # atomic, per the seam contract
+    except OSError:
+        pass
+
+
 def save_state(state: dict, run_dir: Path) -> None:
     """Written after EVERY transition. This is what makes runs resumable and
     hand-editable: kill the process, edit state.json, restart."""
     (run_dir / "state.json").write_text(json.dumps(state, indent=2))
+    write_seam(state)
 
 
 def migrate(state: dict) -> dict:
