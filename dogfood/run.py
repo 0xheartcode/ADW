@@ -305,6 +305,26 @@ def _gate_exit(argv, cwd, env=None):
     return _sh(argv, cwd=cwd, env=env, timeout=90).returncode
 
 
+def scenario_issue_sink() -> bool:
+    """#12: a parked unattended run files a gli issue in the target repo."""
+    _banner("issue-sink")
+    if not shutil.which("gli"):
+        print("issue-sink: SKIP (gli not on PATH)")
+        return True
+    repo = _fresh("sink")
+    _git_init(repo)
+    (repo / "seed.txt").write_text("seed\n")
+    _commit(repo)
+    _sh(["gli", "init"], cwd=repo)
+    _sh([sys.executable, str(ADW), "run", "sinkrun", "--workflow", "demo-thrash",
+         "--worker", "demo", "--repo", str(repo), "--file-issues"], cwd=ROOT)
+    ls = _sh(["gli", "ls", "--state", "open"], cwd=repo).stdout
+    _log("issue-sink", f"target-repo issues:\n{ls}")
+    ok = "ADW parked" in ls and "park:thrash" in ls
+    print(f"issue-sink: {'OK' if ok else 'FAIL'} (issue filed in target repo)")
+    return ok
+
+
 def scenario_paneview() -> bool:
     """#11: panedrive drives ADW's own paneview seam and asserts its park state."""
     _banner("paneview")
@@ -486,6 +506,7 @@ SCENARIOS = {
     "long": scenario_long,
     "deepgates": scenario_deepgates,
     "paneview": scenario_paneview,
+    "issue-sink": scenario_issue_sink,
 }
 
 

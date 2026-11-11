@@ -1062,9 +1062,60 @@ def _advance(state, step, order, run_dir) -> None:
         # A resumed run that recovers must stop advertising why it once
         # stopped, or `show` reports "done  over budget" forever.
         state.pop("stopped_because", None)
+        state.pop("park_kind", None)
         state["ended_at"] = stamp()
+        close_issue_if_any(state)                # close the sink issue, if any
         save_state(state, run_dir)
         print("\nDONE")
+
+
+def _issue_sink_on() -> bool:
+    """Opt-in: ADW_FILE_ISSUES=1 (set by --file-issues) and gli on PATH."""
+    return bool(os.environ.get("ADW_FILE_ISSUES")) and bool(shutil.which("gli"))
+
+
+def file_or_update_issue(state: dict, run_dir: Path) -> None:
+    """Butler issue sink: on a park, file ONE gli issue in the target repo (or
+    update the existing one on a re-park), so an unattended failure becomes a
+    triaged work item. Idempotent via state["issue_id"]; never breaks a run."""
+    if not _issue_sink_on():
+        return
+    repo = state.get("origin_repo", state["workspace"])
+    hint = resume_hint(run_dir, state.get("pending", {}))
+    body = (f"ADW run parked.\n\nrun: {state['run']}\nkind: "
+            f"{state.get('park_kind', '?')}\nreason: {state.get('stopped_because', '')}\n"
+            f"resume: {hint}\nworkflow: {state['workflow']}  worker: {state['worker']}")
+    try:
+        if state.get("issue_id"):
+            note = (f"re-parked [{state.get('park_kind', '?')}]: "
+                    f"{state.get('stopped_because', '')}\nresume: {hint}")
+            subprocess.run(["gli", "comment", state["issue_id"], note],
+                           cwd=repo, capture_output=True, text=True, check=False)
+            return
+        title = f"ADW parked: {state['task'][:50]} [{state.get('park_kind', '?')}]"
+        r = subprocess.run(["gli", "create", title, "-l", "adw", "-l",
+                            f"park:{state.get('park_kind', 'other')}", "-d", body, "-q"],
+                           cwd=repo, capture_output=True, text=True, check=False)
+        issue_id = r.stdout.strip()
+        if r.returncode == 0 and issue_id:
+            state["issue_id"] = issue_id
+            print(f"  filed gli issue {issue_id} in {repo}")
+    except OSError:
+        pass
+
+
+def close_issue_if_any(state: dict) -> None:
+    """When a run that once parked reaches done, close its sink issue."""
+    if not _issue_sink_on() or not state.get("issue_id"):
+        return
+    repo = state.get("origin_repo", state["workspace"])
+    try:
+        subprocess.run(["gli", "close", state["issue_id"], "--reason",
+                        f"ADW run {state['run']} completed"],
+                       cwd=repo, capture_output=True, text=True, check=False)
+        print(f"  closed gli issue {state['issue_id']}")
+    except OSError:
+        pass
 
 
 def classify_park(why: str) -> str:
@@ -1104,6 +1155,7 @@ def _park(state, run_dir, why, pending) -> dict:
     state["pending"] = pending
     state["park_kind"] = classify_park(why)
     state["ended_at"] = stamp()
+    file_or_update_issue(state, run_dir)         # butler sink (opt-in, may set issue_id)
     save_state(state, run_dir)
     print(f"\nPARKED [{state['park_kind']}]: {why}")
     print(f"  actions: {', '.join(pending['actions'])}")
@@ -1303,6 +1355,9 @@ def cmd_graph(args) -> int:
 # ---------------------------------------------------------------------------
 
 def _limits(args) -> dict:
+    # The issue sink reads this env (so _park/_advance need no limits plumbing).
+    if getattr(args, "file_issues", False):
+        os.environ["ADW_FILE_ISSUES"] = "1"
     return {
         "max_cost": args.max_cost,
         "max_wall": args.max_wall * 60,
@@ -1454,6 +1509,9 @@ def main() -> int:
                             "review (how the butler runs it)")
         p.add_argument("--keep-worktree", action="store_true",
                        help="keep the worktree checkout after a clean run")
+        p.add_argument("--file-issues", action="store_true",
+                       help="file/close a gli issue in the target repo on "
+                            "park/done (butler issue sink; needs gli)")
 
     r = sub.add_parser("run")
     r.add_argument("task")
