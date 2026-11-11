@@ -305,6 +305,31 @@ def _gate_exit(argv, cwd, env=None):
     return _sh(argv, cwd=cwd, env=env, timeout=90).returncode
 
 
+def scenario_paneview() -> bool:
+    """#11: panedrive drives ADW's own paneview seam and asserts its park state."""
+    _banner("paneview")
+    panedrive = shutil.which("panedrive")
+    if not panedrive:
+        print("paneview: SKIP (panedrive not on PATH)")
+        return True
+    repo = _fresh("paneview")
+    _git_init(repo)
+    (repo / "seed.txt").write_text("seed\n")
+    _commit(repo)
+    seam = (TMP / "adw.seam.json")
+    pds = ROOT / "dogfood" / "scripts" / "adw-seam.pds"
+    child = (f"cd {ROOT} && exec {sys.executable} {ADW} run seamtask --workflow "
+             f"demo --worker demo --repo {repo} --async")
+    r = _sh([panedrive, "run", str(pds), "--backend", "pty", "--allow-exit",
+             "--state", str(seam), "--", "bash", "-c", child],
+            cwd=ROOT, env={**os.environ, "PANEDRIVE_STATE": str(seam)}, timeout=60)
+    out = r.stdout + r.stderr
+    _log("paneview", f"panedrive exit={r.returncode}\nseam={seam.read_text() if seam.exists() else 'MISSING'}\n\n{out}")
+    ok = r.returncode == 0
+    print(f"paneview: {'OK' if ok else 'FAIL'} (panedrive asserted ADW seam, exit {r.returncode})")
+    return ok
+
+
 def scenario_deepgates() -> bool:
     """#9: each deep gate PASSES on correct code and FAILS on broken (a gate that
     cannot fail certifies nothing), and the tui/sim workflows run through ADW."""
@@ -460,6 +485,7 @@ SCENARIOS = {
     "interview": scenario_interview,
     "long": scenario_long,
     "deepgates": scenario_deepgates,
+    "paneview": scenario_paneview,
 }
 
 
