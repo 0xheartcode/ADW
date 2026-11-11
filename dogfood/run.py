@@ -249,6 +249,55 @@ def scenario_ceiling() -> bool:
     return ok
 
 
+def scenario_interview() -> bool:
+    """#5: panedrive drives the TTY-gated interview headlessly (real keys into a
+    real PTY), the stub interviewer writes acceptance tests, they are committed
+    and the gate passes. Also verifies --async never blocks (it parks)."""
+    _banner("interview")
+    panedrive = shutil.which("panedrive")
+    if not panedrive:
+        print("interview: SKIP (panedrive not on PATH)")
+        return True
+    repo = _fresh("interview")
+    _git_init(repo)
+    (repo / "seed.txt").write_text("seed\n")
+    _commit(repo)
+    pds = ROOT / "dogfood" / "scripts" / "interview.pds"
+    stub = ROOT / "demo" / "interviewer_stub.py"
+    env = {**os.environ, "ADW_INTERVIEW_CMD": f"{sys.executable} {stub}"}
+    # Replay the recorded .pds against ADW's interview, in a real PTY. panedrive
+    # spawns the child in $HOME, so run it from ROOT (adw.py writes runs/ under
+    # the cwd) via a bash wrapper.
+    child = (f"cd {ROOT} && exec {sys.executable} {ADW} run itask --workflow "
+             f"demo-interview --worker demo --repo {repo} --auto-approve")
+    r = _sh([panedrive, "run", str(pds), "--backend", "pty", "--allow-exit", "--",
+             "bash", "-c", child], cwd=ROOT, env=env, timeout=90)
+    run_dir = max(Path(ROOT, "runs").glob("*itask*"), key=lambda p: p.stat().st_mtime)
+    st = json.loads((run_dir / "state.json").read_text())
+    driven_ok = (st["status"] == "done" and (repo / "test_accept.py").exists())
+
+    # --async must PARK the interview, never block on stdin.
+    repo2 = _fresh("interview-async")
+    _git_init(repo2)
+    (repo2 / "seed.txt").write_text("seed\n")
+    _commit(repo2)
+    r2 = _sh([sys.executable, str(ADW), "run", "iasync", "--workflow",
+              "demo-interview", "--worker", "demo", "--repo", str(repo2),
+              "--async"], cwd=ROOT, timeout=30)
+    run_dir2 = max(Path(ROOT, "runs").glob("*iasync*"), key=lambda p: p.stat().st_mtime)
+    st2 = json.loads((run_dir2 / "state.json").read_text())
+    async_ok = st2["status"] == "parked" and "needs a human" in st2.get("stopped_because", "")
+
+    _log("interview", f"panedrive exit={r.returncode} driven status={st['status']} "
+         f"test_accept={ (repo / 'test_accept.py').exists() }\n"
+         f"async exit={r2.returncode} async status={st2['status']} "
+         f"stopped_because={st2.get('stopped_because')}\n\n{r.stdout}{r.stderr}")
+    ok = driven_ok and async_ok
+    print(f"interview: {'OK' if ok else 'FAIL'} "
+          f"(panedrive-driven={driven_ok}, async-parks={async_ok})")
+    return ok
+
+
 def scenario_thrash() -> bool:
     """#7: a non-converging run parks 'not converging'; a converging one finishes."""
     _banner("thrash")
@@ -283,6 +332,7 @@ SCENARIOS = {
     "rate-limit": scenario_rate_limit,
     "ceiling": scenario_ceiling,
     "thrash": scenario_thrash,
+    "interview": scenario_interview,
 }
 
 

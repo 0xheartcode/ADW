@@ -1,0 +1,8 @@
+# Human demo for the interview step (gli #5), captured once and replayed by
+# panedrive against a real PTY so the TTY-gated interview is driven headlessly.
+# Steps run top to bottom in one process.
+sleep 1200
+type login must redirect to the home page
+press Enter
+sleep 1500
+capture
