@@ -24,6 +24,7 @@ import json
 import os
 import re
 import select
+import shlex
 import shutil
 import subprocess
 import sys
@@ -37,6 +38,11 @@ INDEX = RUNS_DIR / "index.jsonl"
 # Never belongs in an attempt commit, whatever the worker. A gate that runs
 # pytest creates these every single time, and they drown the review diff.
 ARTIFACTS = ["__pycache__", "*.pyc", ".pytest_cache", ".ruff_cache"]
+
+# A plan step asks the worker to write this file (in the workspace, its cwd);
+# the orchestrator reads it, copies it into the run dir for the record, and
+# deletes it before snapshotting so it never lands in the review diff.
+PLAN_FILE = "plan.json"
 
 GATE_HEAD = 2000  # chars from the start of gate output (first traceback)
 GATE_TAIL = 2000  # chars from the end (pytest's summary)
@@ -150,6 +156,12 @@ WORKERS = {
         "cmd": [sys.executable, str(HERE / "demo/worker.py"), "{prompt}"],
         "stream": "claude-json",
     },
+    # Like demo, but it also writes a valid plan.json when asked to plan, so the
+    # plan step and its splice can be exercised offline. See demo/plan_worker.py.
+    "demo-plan": {
+        "cmd": [sys.executable, str(HERE / "demo/plan_worker.py"), "{prompt}"],
+        "stream": "claude-json",
+    },
 }
 
 
@@ -219,6 +231,14 @@ WORKFLOWS = {
         {"kind": "gate", "name": "check",
          "cmd": [sys.executable, str(HERE / "demo/gate_stuck.py")], "on_fail": "build", "max": 5},
     ],
+    # A plan step and nothing else: it emits gated milestones that get spliced in
+    # and run, ending in a human review. Run with --worker demo-plan, offline.
+    "demo-plan": [
+        {"kind": "plan", "name": "plan", "max": 2,
+         "prompt": "{task}\n\nBreak this into ordered milestones. Write "
+                   "plan.json: a JSON list of {{id, prompt, gate}} where gate "
+                   "is an argv the milestone must pass. Do not implement yet."},
+    ],
 }
 
 
@@ -244,7 +264,7 @@ def validate(steps: list, worker: str) -> list:
 
     for s in steps:
         kind = s.get("kind")
-        if kind not in ("agent", "gate", "human"):
+        if kind not in ("agent", "gate", "human", "plan", "interview"):
             errors.append(f"{s.get('name')}: bad kind {kind!r}")
         if kind == "gate":
             # on_fail of None is legal and means "failure here is fatal". Not
@@ -258,7 +278,9 @@ def validate(steps: list, worker: str) -> list:
                 errors.append(f"{s['name']}: needs an integer max >= 1")
             if not shutil.which(s["cmd"][0]):
                 errors.append(f"{s['name']}: command not on PATH: {s['cmd'][0]}")
-        if kind == "agent" and "{task}" not in s.get("prompt", ""):
+        # A plan step is an agent that emits steps; it carries {task} like any
+        # agent prompt. An interview step (human + agent at a TTY) does too.
+        if kind in ("agent", "plan", "interview") and "{task}" not in s.get("prompt", ""):
             errors.append(f"{s['name']}: prompt never references {{task}}")
 
     return errors
@@ -569,6 +591,60 @@ def run_human(state: dict, limits: dict) -> str:
 
 
 # ---------------------------------------------------------------------------
+# DYNAMIC STEP EMISSION (the plan step)
+#
+# A plan step decomposes {task} into milestones and splices a gated step pair
+# per milestone into the running workflow. This is the one primitive that turns
+# one task into a long, gated chain. The planner's output is UNTRUSTED: it is
+# run through the same validate() every static workflow passes, and a bad plan
+# is treated exactly like a failed gate (feedback + bounded retries + park).
+# ---------------------------------------------------------------------------
+
+def expand_milestones(milestones: list) -> list:
+    """Turn [{id, prompt, gate}, ...] into gated steps, ending in a review.
+
+    Each milestone becomes an agent step (do.<id>) and a gate (ok.<id>) that
+    routes back to that agent on failure - the identical shape a hand-written
+    workflow uses, so no new orchestration machinery is needed downstream.
+    Raises KeyError/TypeError on a malformed milestone; the caller treats that
+    as a rejected plan.
+    """
+    if not isinstance(milestones, list) or not milestones:
+        raise ValueError("plan must be a non-empty JSON list of milestones")
+    out = []
+    for m in milestones:
+        mid = str(m["id"])
+        gate = m["gate"]
+        gate = shlex.split(gate) if isinstance(gate, str) else list(gate)
+        if not gate:
+            raise ValueError(f"milestone {mid!r}: empty gate")
+        out += [
+            {"kind": "agent", "name": f"do.{mid}",
+             "prompt": m["prompt"] + "\n\nOverall goal: {task}"},
+            {"kind": "gate", "name": f"ok.{mid}",
+             "cmd": gate, "on_fail": f"do.{mid}", "max": 3},
+        ]
+    return out + [{"kind": "human", "name": "review"}]
+
+
+def read_plan(state: dict, run_dir: Path) -> list:
+    """Read the worker-written plan from the workspace, copy it into the run dir
+    for the record, and remove it from the workspace so it is never committed.
+
+    Returns the parsed milestones list. Raises OSError/JSONDecodeError on a
+    missing or unparseable plan - the caller treats that as a rejected plan.
+    """
+    src = Path(state["workspace"]) / PLAN_FILE
+    if not src.exists():
+        raise FileNotFoundError(
+            f"{PLAN_FILE} not found - the plan step must write it to the repo root")
+    raw = src.read_text()
+    (run_dir / PLAN_FILE).write_text(raw)   # the record show/graph can read
+    src.unlink()                            # keep it out of the snapshot diff
+    return json.loads(raw)
+
+
+# ---------------------------------------------------------------------------
 # THE ORCHESTRATOR
 #
 # A pointer into a list, a dict of attempt counts, and a loop.
@@ -621,6 +697,48 @@ def orchestrate(state: dict, steps: list, run_dir: Path, limits: dict) -> dict:
                 return _stop(state, run_dir,
                              f"worker stopped: {result.get('subtype', 'unknown')}")
             _advance(state, step, order, run_dir)
+
+        elif step["kind"] == "plan":
+            # An agent step that EMITS steps. Same retry-with-feedback contract
+            # as a normal agent; its product (plan.json) is then gated.
+            prompt = step["prompt"].format(task=state["task"])
+            if state["feedback"]:
+                prompt += f"\n\nThe previous attempt failed:\n{state['feedback']}"
+                state["feedback"] = None
+            try:
+                result = run_agent(prompt, state, run_dir, limits)
+            except (RuntimeError, OSError) as exc:
+                snapshot(state, f"{step['name']} attempt {n} (worker failed)")
+                return _stop(state, run_dir, f"worker failed: {exc}")
+            if result.get("is_error"):
+                snapshot(state, f"{step['name']} attempt {n}")
+                return _stop(state, run_dir,
+                             f"worker stopped: {result.get('subtype', 'unknown')}")
+            # Read+move plan.json BEFORE the snapshot so it never hits the diff.
+            # The plan is UNTRUSTED, so run it through the same validate() every
+            # static workflow passes; a bad plan is handled like a failed gate.
+            try:
+                milestones = read_plan(state, run_dir)
+                new_steps = expand_milestones(milestones)
+                errs = validate(steps + new_steps, state["worker"])
+            except (OSError, json.JSONDecodeError, KeyError,
+                    TypeError, ValueError) as exc:
+                milestones, new_steps, errs = None, None, [f"{PLAN_FILE} unusable: {exc}"]
+            snapshot(state, f"{step['name']} attempt {n}")
+            if errs:
+                state["feedback"] = "plan rejected:\n" + "\n".join(errs)
+                if n >= step.get("max", 2):
+                    return _stop(state, run_dir,
+                                 "planner could not produce a valid plan")
+                continue                       # retry the plan step
+            i = order.index(step["name"])
+            steps[i + 1:i + 1] = new_steps     # splice into the live list...
+            state["steps"] = steps             # ...which is state["steps"]
+            by_name = {s["name"]: s for s in steps}
+            order = [s["name"] for s in steps]
+            save_state(state, run_dir)
+            transition(state, new_steps[0]["name"],
+                       f"{len(milestones)} milestones", run_dir)
 
         elif step["kind"] == "gate":
             passed, excerpt = run_gate(step, state, run_dir, n)
