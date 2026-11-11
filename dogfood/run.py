@@ -7,9 +7,13 @@ Scenarios are added as issues land. Each returns True on success. Logs go to
 dogfood/logs/<scenario>.log and are referenced from commit bodies / gli notes.
 Stdlib only, like adw.py — no third-party imports here either.
 """
+import json
+import os
 import shutil
+import signal
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -89,9 +93,76 @@ def scenario_logic() -> bool:
     return ok
 
 
+def scenario_crash_resume() -> bool:
+    """#1/#2: splice a plan, SIGKILL ADW mid-milestone, resume -> no KeyError."""
+    _banner("crash-resume")
+    repo = _fresh("crash")
+    _git_init(repo)
+    (repo / "seed.txt").write_text("seed\n")
+    _commit(repo)
+    task = "crash-resume-proof"
+    env = {**os.environ, "ADW_DEMO_SLEEP": "2"}   # widen the do-step window
+    # Spawn in its own session so we can kill the whole process group hard.
+    proc = subprocess.Popen(
+        [sys.executable, str(ADW), "run", task, "--workflow", "demo-plan",
+         "--worker", "demo-plan", "--repo", str(repo), "--async"],
+        cwd=ROOT, env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+        text=True, start_new_session=True)
+    run_dir, killed_at = None, None
+    deadline = time.time() + 30
+    while time.time() < deadline:
+        if run_dir is None:
+            hits = sorted(Path(ROOT, "runs").glob(f"*{task}*"),
+                          key=lambda p: p.stat().st_mtime, reverse=True)
+            run_dir = hits[0] if hits else None
+        if run_dir and (run_dir / "state.json").exists():
+            try:
+                step = json.loads((run_dir / "state.json").read_text())["step"]
+            except (json.JSONDecodeError, KeyError):
+                step = None
+            if step and step.startswith("do."):
+                killed_at = step
+                os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+                break
+        if proc.poll() is not None:
+            break
+        time.sleep(0.1)
+    try:
+        proc.wait(timeout=5)
+    except subprocess.TimeoutExpired:
+        os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+
+    if not killed_at:
+        _log("crash-resume", "FAILED to catch the run mid-milestone")
+        print("crash-resume: FAIL (never caught a do.* step)")
+        return False
+
+    # The killed process left state mid-run. Resume must finish with no KeyError.
+    r = subprocess.run(
+        [sys.executable, str(ADW), "resume", str(run_dir), "--async"],
+        cwd=ROOT, capture_output=True, text=True, timeout=60, check=False)
+    out = r.stdout + r.stderr
+    final = json.loads((run_dir / "state.json").read_text())
+    log = (f"killed at step: {killed_at}\n"
+           f"resume exit: {r.returncode}\nfinal status: {final['status']}\n"
+           f"final step: {final['step']}\n"
+           f"steps: {[s['name'] for s in final['steps']]}\n\n{out}")
+    _log("crash-resume", log)
+    # Parked at review (==done bar the human nod) with every milestone present,
+    # and no KeyError/Traceback anywhere.
+    ok = ("KeyError" not in out and "Traceback" not in out
+          and final["status"] in ("parked", "done")
+          and final["step"] == "review"
+          and "do.m2" in [s["name"] for s in final["steps"]])
+    print(f"crash-resume: {'OK' if ok else 'FAIL'} "
+          f"(killed at {killed_at}, resumed to {final['status']}/{final['step']})")
+    return ok
+
+
 SCENARIOS = {
     "demo": scenario_demo,
     "logic": scenario_logic,
+    "crash-resume": scenario_crash_resume,
 }
 
 
