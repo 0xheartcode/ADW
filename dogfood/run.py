@@ -249,6 +249,32 @@ def scenario_ceiling() -> bool:
     return ok
 
 
+def scenario_thrash() -> bool:
+    """#7: a non-converging run parks 'not converging'; a converging one finishes."""
+    _banner("thrash")
+
+    def _run(name, flow, extra):
+        repo = _fresh(name)
+        _git_init(repo)
+        (repo / "seed.txt").write_text("seed\n")
+        _commit(repo)
+        _sh([sys.executable, str(ADW), "run", name, "--workflow", flow,
+             "--worker", "demo", "--repo", str(repo), *extra], cwd=ROOT)
+        rd = max(Path(ROOT, "runs").glob(f"*{name}*"), key=lambda p: p.stat().st_mtime)
+        return json.loads((rd / "state.json").read_text())
+
+    thr = _run("thrash-bad", "demo-thrash", ["--async"])
+    conv = _run("thrash-good", "demo-converge", ["--auto-approve"])
+    _log("thrash", f"non-converging: status={thr['status']} "
+         f"stopped_because={thr.get('stopped_because')} attempts={thr['attempts']}\n"
+         f"converging: status={conv['status']} attempts={conv['attempts']}\n")
+    ok = (thr["status"] == "parked" and "not converging" in thr.get("stopped_because", "")
+          and thr["attempts"]["check"] < 8 and conv["status"] == "done")
+    print(f"thrash: {'OK' if ok else 'FAIL'} "
+          f"(bad={thr['status']}/{thr.get('stopped_because','')[:20]}, good={conv['status']})")
+    return ok
+
+
 SCENARIOS = {
     "demo": scenario_demo,
     "logic": scenario_logic,
@@ -256,6 +282,7 @@ SCENARIOS = {
     "subscription": scenario_subscription,
     "rate-limit": scenario_rate_limit,
     "ceiling": scenario_ceiling,
+    "thrash": scenario_thrash,
 }
 
 

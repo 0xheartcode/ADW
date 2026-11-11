@@ -248,6 +248,22 @@ WORKFLOWS = {
         {"kind": "gate", "name": "check",
          "cmd": [sys.executable, str(HERE / "demo/gate_stuck.py")], "on_fail": "build", "max": 5},
     ],
+    # Fails differently every attempt but never closer - the thrash detector
+    # should park it with "not converging" well before `max`.
+    "demo-thrash": [
+        {"kind": "agent", "name": "build", "prompt": "{task}"},
+        {"kind": "gate", "name": "check",
+         "cmd": [sys.executable, str(HERE / "demo/gate_thrash.py")],
+         "on_fail": "build", "max": 8, "thrash_window": 2},
+    ],
+    # Genuinely converges (3->2->1->pass): the detector must NOT trip it.
+    "demo-converge": [
+        {"kind": "agent", "name": "build", "prompt": "{task}"},
+        {"kind": "gate", "name": "check",
+         "cmd": [sys.executable, str(HERE / "demo/gate_converge.py")],
+         "on_fail": "build", "max": 8, "thrash_window": 2},
+        {"kind": "human", "name": "review"},
+    ],
     # A plan step and nothing else: it emits gated milestones that get spliced in
     # and run, ending in a human review. Run with --worker demo-plan, offline.
     "demo-plan": [
@@ -352,6 +368,7 @@ def migrate(state: dict) -> dict:
     state.setdefault("head", head(ws))
     state.setdefault("base", state["head"])
     state.setdefault("turns", 0)
+    state.setdefault("thrash", {})
     # The effective step list is the source of truth for resume. Older runs
     # (and runs that never spliced) are backfilled from the static template, so
     # a resume always has a list that contains state["step"] - including any
@@ -633,6 +650,48 @@ def run_gate(step: dict, state: dict, run_dir: Path, attempt: int):
     return passed, excerpt
 
 
+# A big sentinel so panedrive's "how far did it get" maps into a shrink-smaller
+# scale (further progress -> smaller signature) without going negative.
+_PANEDRIVE_STEPS = 1000
+
+
+def _json_objects(text: str):
+    """Yield dict objects from a gate's output. panedrive --json and simharness
+    --json each emit a single-line JSON object, so a line-by-line parse is
+    enough and never chokes on the surrounding human text."""
+    for line in text.splitlines():
+        line = line.strip()
+        if line.startswith("{") and line.endswith("}"):
+            try:
+                obj = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if isinstance(obj, dict):
+                yield obj
+
+
+def failure_signature(excerpt: str) -> int:
+    """A numeric size of a gate failure where SMALLER == closer to passing, so a
+    converging agent drives it down. Read from STRUCTURED gate output first
+    (simharness/panedrive JSON, pytest summary), with a coarse line-count
+    fallback. This is the signal the thrash detector requires to keep shrinking.
+    """
+    for obj in _json_objects(excerpt):
+        if isinstance(obj.get("asserts"), list):            # simharness assert
+            return sum(1 for a in obj["asserts"] if not a.get("ok", True))
+        if isinstance(obj.get("breaks"), list):             # simharness fuzz
+            return len(obj["breaks"])
+        if "steps" in obj and "ok" in obj:                  # panedrive run
+            fs = obj.get("failed_step")
+            if fs is not None:
+                return max(0, _PANEDRIVE_STEPS - int(fs))   # further = smaller
+            return sum(1 for s in obj["steps"] if not s.get("ok", True))
+    m = re.search(r"(\d+) failed", excerpt)                 # pytest-style
+    if m:
+        return int(m.group(1))
+    return len(excerpt.splitlines())                        # coarse fallback
+
+
 def run_human(state: dict, limits: dict) -> str:
     """The Approve / Reject node. This is what makes it supervised.
 
@@ -853,14 +912,30 @@ def orchestrate(state: dict, steps: list, run_dir: Path, limits: dict) -> dict:
                 _advance(state, step, order, run_dir)
             elif step.get("on_fail") is None:
                 return _stop(state, run_dir, f"{step['name']} failed (no retry path)")
-            elif state["gate_hashes"].get(step["name"]) == digest:
-                # Identical failure twice running: the agent is oscillating,
-                # not converging. Burning the remaining attempts costs money
-                # and buys nothing.
-                return _stop(state, run_dir, f"{step['name']} failed identically twice")
-            elif n >= step["max"]:
-                return _stop(state, run_dir, f"{step['name']} exhausted {n} attempts")
             else:
+                # Convergence check. The failure SIGNATURE (smaller = closer to
+                # passing, read from structured gate output when available) must
+                # keep shrinking. If it stops improving for thrash_window
+                # attempts the agent is thrashing - fails differently but no
+                # closer - and burning the rest of the budget buys nothing.
+                sig = failure_signature(excerpt)
+                th = state.setdefault("thrash", {}).setdefault(
+                    step["name"], {"best": None, "stale": 0})
+                if th["best"] is None or sig < th["best"]:
+                    th["best"], th["stale"] = sig, 0
+                else:
+                    th["stale"] += 1
+
+                if state["gate_hashes"].get(step["name"]) == digest:
+                    return _stop(state, run_dir,
+                                 f"{step['name']} failed identically twice")
+                if th["stale"] >= step.get("thrash_window", 2):
+                    return _stop(state, run_dir,
+                                 f"{step['name']} not converging "
+                                 f"(failure signature stuck at {th['best']})")
+                if n >= step["max"]:
+                    return _stop(state, run_dir,
+                                 f"{step['name']} exhausted {n} attempts")
                 state["gate_hashes"][step["name"]] = digest
                 state["feedback"] = excerpt
                 transition(state, step["on_fail"], f"{step['name']} failed", run_dir)
@@ -1055,8 +1130,8 @@ def cmd_run(args) -> int:
         "worker": args.worker, "workspace": str(workspace), "branch": branch,
         "origin_repo": str(repo), "base": head(workspace), "head": head(workspace),
         "step": steps[0]["name"], "status": "running", "attempts": {},
-        "gate_hashes": {}, "cost_usd": 0.0, "feedback": None, "stream_types": {},
-        "turns": 0,
+        "gate_hashes": {}, "thrash": {}, "cost_usd": 0.0, "feedback": None,
+        "stream_types": {}, "turns": 0,
         "started_at": stamp(),
         "history": [],
         # The effective step list, persisted so a resumed run - including one a
