@@ -54,3 +54,15 @@ check:
 
 # Everything that costs nothing
 test: check demo demo-stuck
+
+# Dev test suite (pytest+hypothesis live in .venv; adw.py stays zero-dep)
+test-py:
+    .venv/bin/python -m pytest tests/ -q
+
+# Enforce the zero-dependency runtime invariant
+check-deps:
+    .venv/bin/python -m pytest tests/test_zero_dep.py -q
+
+# Run ADW for real against throwaway sandboxes
+dogfood scenario="all":
+    .venv/bin/python dogfood/run.py {{scenario}}
