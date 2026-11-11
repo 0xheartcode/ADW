@@ -159,10 +159,37 @@ def scenario_crash_resume() -> bool:
     return ok
 
 
+def scenario_subscription() -> bool:
+    """#3: real claude-code subscription worker (no API key). Opt-in - spends
+    plan usage. Set ADW_DOGFOOD_SUBSCRIPTION=1 to run it."""
+    _banner("subscription")
+    if os.environ.get("ADW_DOGFOOD_SUBSCRIPTION") != "1":
+        print("subscription: SKIP (set ADW_DOGFOOD_SUBSCRIPTION=1 to run; "
+              "last real run recorded in dogfood/logs/subscription-worker.log)")
+        return True
+    if not shutil.which("claude"):
+        print("subscription: SKIP (claude not on PATH)")
+        return True
+    repo = _fresh("subscription")
+    _git_init(repo)
+    (repo / "seed.txt").write_text("seed\n")
+    _commit(repo)
+    r = _sh([sys.executable, str(ADW), "run",
+             "Create a file named greeting.txt whose only contents are the word hello",
+             "--workflow", "chore", "--worker", "claude-code",
+             "--repo", str(repo), "--max-cost", "2"], cwd=ROOT, timeout=300)
+    out = r.stdout + r.stderr
+    _log("subscription", out)
+    ok = r.returncode == 0 and "DONE" in out and (repo / "greeting.txt").exists()
+    print(f"subscription: {'OK' if ok else 'FAIL'} (exit {r.returncode})")
+    return ok
+
+
 SCENARIOS = {
     "demo": scenario_demo,
     "logic": scenario_logic,
     "crash-resume": scenario_crash_resume,
+    "subscription": scenario_subscription,
 }
 
 

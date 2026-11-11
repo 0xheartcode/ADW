@@ -150,6 +150,23 @@ WORKERS = {
         "cmd": ["codex", "exec", "{prompt}"],
         "stream": "plain",
     },
+    # Claude Code on a Max/Pro SUBSCRIPTION login - no ANTHROPIC_API_KEY. `claude
+    # -p` uses whatever auth is configured, so requires_env is empty. There is no
+    # {budget}: a subscription is not dollar-metered, so --max-budget-usd does not
+    # apply; run_agent warns once and runs uncapped, bounded by plan usage and by
+    # the turn/wall ceilings instead (see --max-turns). --output-format json emits
+    # one result event _narrate reads. --dangerously-skip-permissions is required:
+    # -p has no TTY to answer prompts, and containment is the worktree + snapshot
+    # + gate + human-review diff, not the permission prompt. Pairs with the
+    # rate-limit park (a subscription limit must park, not retry into the wall).
+    "claude-code": {
+        "cmd": [
+            "claude", "-p", "--dangerously-skip-permissions",
+            "--output-format", "json", "{prompt}",
+        ],
+        "stream": "claude-json",
+        "requires_env": [],
+    },
     # Costs nothing, never varies. Lets you exercise the retry loop, the
     # breakers and the counters without an LLM in the way. See demo/.
     "demo": {
