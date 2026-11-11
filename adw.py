@@ -248,6 +248,15 @@ WORKFLOWS = {
         {"kind": "gate", "name": "check",
          "cmd": [sys.executable, str(HERE / "demo/gate_stuck.py")], "on_fail": "build", "max": 5},
     ],
+    # Interview first (writes acceptance tests), then a gate that enforces they
+    # exist. Drive the TTY with ADW_INTERVIEW_CMD=python3 demo/interviewer_stub.py.
+    "demo-interview": [
+        {"kind": "interview", "name": "interview",
+         "prompt": "{task}\n\nInterview me, then write acceptance tests."},
+        {"kind": "gate", "name": "accept",
+         "cmd": ["test", "-f", "test_accept.py"], "on_fail": None, "max": 1},
+        {"kind": "human", "name": "review"},
+    ],
     # Fails differently every attempt but never closer - the thrash detector
     # should park it with "not converging" well before `max`.
     "demo-thrash": [
@@ -903,6 +912,21 @@ def orchestrate(state: dict, steps: list, run_dir: Path, limits: dict) -> dict:
             save_state(state, run_dir)
             transition(state, new_steps[0]["name"],
                        f"{len(milestones)} milestones", run_dir)
+
+        elif step["kind"] == "interview":
+            # Pin "done" as tests BEFORE any build: a human + an interactive agent
+            # co-write the acceptance criteria as runnable tests, which the normal
+            # gates then enforce. Needs a real keyboard - no TTY, or --async, must
+            # park (never silently skip). This is interactive (NOT -p). The
+            # ADW_INTERVIEW_CMD seam lets a driver/test stand in for `claude`.
+            if limits.get("noninteractive") or not sys.stdin.isatty():
+                return _stop(state, run_dir,
+                             "interview needs a human at the keyboard")
+            cmd = shlex.split(os.environ.get("ADW_INTERVIEW_CMD", "claude"))
+            cmd.append(step["prompt"].format(task=state["task"]))
+            subprocess.run(cmd, cwd=state["workspace"], check=False)
+            snapshot(state, "interview")         # commit the criteria for the gates
+            _advance(state, step, order, run_dir)
 
         elif step["kind"] == "gate":
             passed, excerpt = run_gate(step, state, run_dir, n)
