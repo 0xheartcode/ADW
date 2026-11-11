@@ -436,6 +436,34 @@ def scenario_deepgates() -> bool:
     return ok
 
 
+def scenario_rust() -> bool:
+    """#15: the csd architectural gate PASSES on a clean change and FAILS when a
+    layering violation is introduced (exit 1), using our own csd."""
+    _banner("rust")
+    if not shutil.which("csd"):
+        print("rust: SKIP (csd not on PATH)")
+        return True
+    repo = _fresh("rust")
+    shutil.copytree(FIX / "rust", repo, dirs_exist_ok=True)
+    _git_init(repo)
+    _commit(repo, "clean base")
+    base = _sh(["git", "rev-parse", "HEAD"], cwd=repo).stdout.strip()
+    gate = ["csd", "diff", "--base", base, "--list"]
+    clean_exit = _gate_exit(gate, repo)
+    # Introduce a layering violation: low (bottom) now depends on high (top).
+    (repo / "src" / "low.rs").write_text(
+        "use crate::high;\npub fn base() -> i32 { high::dummy(); 1 }\n")
+    (repo / "src" / "high.rs").write_text(
+        "use crate::low; pub fn go() { let _ = low::base(); } pub fn dummy() {}\n")
+    _commit(repo, "introduce layering violation")
+    viol_exit = _gate_exit(gate, repo)
+    _log("rust", f"csd clean_exit={clean_exit} violation_exit={viol_exit}")
+    ok = clean_exit == 0 and viol_exit != 0
+    print(f"rust: {'OK' if ok else 'FAIL'} "
+          f"(clean={clean_exit}, violation={viol_exit})")
+    return ok
+
+
 def scenario_long() -> bool:
     """#6: the whole long workflow end-to-end, offline - interview (panedrive
     over a real PTY) -> plan/splice -> milestones -> review -> done."""
@@ -507,6 +535,7 @@ SCENARIOS = {
     "deepgates": scenario_deepgates,
     "paneview": scenario_paneview,
     "issue-sink": scenario_issue_sink,
+    "rust": scenario_rust,
 }
 
 

@@ -1,0 +1,13 @@
+[layers]
+order = ["high", "low"]
+map = [
+    { layer = "low",  glob = "src/low.rs" },
+    { layer = "high", glob = "src/high.rs" },
+]
+forbid = [{ from = "low", to = "high" }]
+[views]
+enabled = ["modules"]
+[lint]
+deny = ["layering", "cycles"]
+[ratchet]
+mode = "new-only"

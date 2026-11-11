@@ -249,6 +249,18 @@ WORKFLOWS = {
          "cmd": ["simharness", "assert"], "on_fail": "build", "max": 3},
         {"kind": "human", "name": "review"},
     ],
+    # rust: an architectural ratchet gate. `csd diff --base <ref>` exits 1 on a
+    # denied finding (a layering/cycle violation introduced by the change) and 0
+    # otherwise; --list makes the delta a parseable convergence signal. {base} is
+    # the run's starting commit, so the whole run is judged, not one attempt.
+    "rust": [
+        {"kind": "agent", "name": "build",
+         "prompt": "{task}\n\nImplement this without introducing an "
+                   "architectural (layering/cycle) violation."},
+        {"kind": "gate", "name": "arch", "on_fail": "build", "max": 3,
+         "cmd": ["csd", "diff", "--base", "{base}", "--list"]},
+        {"kind": "human", "name": "review"},
+    ],
     # An LLM reviewing the agent's diff - as a GATE, not a new step kind.
     # The judge's exit code is the routing and its stdout is the feedback, so
     # "one agent hands work to another" needs no machinery beyond what a
@@ -771,6 +783,12 @@ def failure_signature(excerpt: str) -> int:
             if fs is not None:
                 return max(0, _PANEDRIVE_STEPS - int(fs))   # further = smaller
             return sum(1 for s in obj["steps"] if not s.get("ok", True))
+    # csd --list delta: each denied/changed structural element is one marked
+    # line; fewer as the agent removes violations -> a shrinking signature.
+    csd = re.findall(
+        r"(?m)^[+~-] (?:edge|fn|type|mod|node|struct|enum|trait)\b", excerpt)
+    if csd:
+        return len(csd)
     m = re.search(r"(\d+) failed", excerpt)                 # pytest-style
     if m:
         return int(m.group(1))
