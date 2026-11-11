@@ -187,6 +187,23 @@ WORKERS = {
 # ---------------------------------------------------------------------------
 
 WORKFLOWS = {
+    # The long-horizon flow: pin acceptance tests at an interview, decompose into
+    # gated milestones at a plan step (which splices them in, ending in a human
+    # review), and let the gates - not the agent - decide "done". Keep each agent
+    # step a fresh worker burst; the harness (runs/ + resume) carries length.
+    "long": [
+        {"kind": "interview", "name": "interview",
+         "prompt": "{task}\n\nInterview me until the acceptance criteria are "
+                   "unambiguous, then write them as runnable tests (pytest, a "
+                   "panedrive .pds, or a simharness config - whatever the deep "
+                   "gate for this project enforces). Do not implement."},
+        {"kind": "plan", "name": "plan", "max": 2,
+         "prompt": "{task}\n\nGiven the committed acceptance tests, break this "
+                   "into ordered milestones. Write plan.json: a JSON list of "
+                   "{{id, prompt, gate}} where gate is an argv the milestone "
+                   "must pass. Do not implement yet."},
+        # the plan step splices gated milestones here, ending in a human review.
+    ],
     "feature": [
         {"kind": "agent", "name": "build",
          "prompt": "{task}\n\nImplement this. Write tests for what you add."},

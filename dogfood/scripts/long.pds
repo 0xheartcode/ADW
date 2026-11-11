@@ -1,0 +1,8 @@
+# Drive the whole long-horizon run (gli #6): answer the interview, then let the
+# plan step and its spliced milestones run to the human review. The milestones
+# are instant with the demo-plan worker, so a generous final wait lets ADW finish.
+sleep 1200
+type the feature must pass its acceptance tests
+press Enter
+sleep 4000
+capture

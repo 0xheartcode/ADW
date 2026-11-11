@@ -298,6 +298,38 @@ def scenario_interview() -> bool:
     return ok
 
 
+def scenario_long() -> bool:
+    """#6: the whole long workflow end-to-end, offline - interview (panedrive
+    over a real PTY) -> plan/splice -> milestones -> review -> done."""
+    _banner("long")
+    panedrive = shutil.which("panedrive")
+    if not panedrive:
+        print("long: SKIP (panedrive not on PATH)")
+        return True
+    repo = _fresh("long")
+    _git_init(repo)
+    (repo / "seed.txt").write_text("seed\n")
+    _commit(repo)
+    pds = ROOT / "dogfood" / "scripts" / "long.pds"
+    stub = ROOT / "demo" / "interviewer_stub.py"
+    env = {**os.environ, "ADW_INTERVIEW_CMD": f"{sys.executable} {stub}"}
+    child = (f"cd {ROOT} && exec {sys.executable} {ADW} run longtask --workflow "
+             f"long --worker demo-plan --repo {repo} --auto-approve")
+    r = _sh([panedrive, "run", str(pds), "--backend", "pty", "--allow-exit", "--",
+             "bash", "-c", child], cwd=ROOT, env=env, timeout=120)
+    run_dir = max(Path(ROOT, "runs").glob("*longtask*"), key=lambda p: p.stat().st_mtime)
+    st = json.loads((run_dir / "state.json").read_text())
+    names = [s["name"] for s in st["steps"]]
+    _log("long", f"panedrive exit={r.returncode} status={st['status']}\n"
+         f"steps={names}\ntest_accept={(repo / 'test_accept.py').exists()}\n"
+         f"plan.json={(run_dir / 'plan.json').exists()}\n\n{r.stdout}{r.stderr}")
+    ok = (st["status"] == "done"
+          and names == ["interview", "plan", "do.m1", "ok.m1", "do.m2", "ok.m2", "review"]
+          and (repo / "test_accept.py").exists())
+    print(f"long: {'OK' if ok else 'FAIL'} (status={st['status']}, steps={len(names)})")
+    return ok
+
+
 def scenario_thrash() -> bool:
     """#7: a non-converging run parks 'not converging'; a converging one finishes."""
     _banner("thrash")
@@ -333,6 +365,7 @@ SCENARIOS = {
     "ceiling": scenario_ceiling,
     "thrash": scenario_thrash,
     "interview": scenario_interview,
+    "long": scenario_long,
 }
 
 
