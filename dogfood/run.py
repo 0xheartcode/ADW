@@ -185,11 +185,53 @@ def scenario_subscription() -> bool:
     return ok
 
 
+def scenario_rate_limit() -> bool:
+    """#4: full ADW CLI hits a usage limit (stub-verified) -> parks, no retry,
+    then resumes cleanly once the limit clears."""
+    _banner("rate-limit")
+    repo = _fresh("ratelimit")
+    _git_init(repo)
+    (repo / "seed.txt").write_text("seed\n")
+    _commit(repo)
+    env = {**os.environ, "ADW_DEMO_RATELIMIT": "1"}
+    r = _sh([sys.executable, str(ADW), "run", "rl-proof", "--workflow", "demo",
+             "--worker", "demo", "--repo", str(repo), "--async"], cwd=ROOT, env=env)
+    out = r.stdout + r.stderr
+    run_dir = max(Path(ROOT, "runs").glob("*rl-proof*"),
+                  key=lambda p: p.stat().st_mtime)
+    st = json.loads((run_dir / "state.json").read_text())
+    parked_ok = (st["status"] == "parked" and st["attempts"].get("build") == 1
+                 and "usage/rate limit" in st.get("stopped_because", ""))
+    # Now the limit has cleared: resume with the normal worker; must complete.
+    r2 = _sh([sys.executable, str(ADW), "resume", str(run_dir), "--async",
+              "--approve"], cwd=ROOT)
+    # First resume re-enters build (worker ok now) then runs the gate to a park
+    # at review; approve the review to finish. Drive to done.
+    r3 = _sh([sys.executable, str(ADW), "resume", str(run_dir), "--async"], cwd=ROOT)
+    final = json.loads((run_dir / "state.json").read_text())
+    for _ in range(4):
+        if final["status"] == "done":
+            break
+        _sh([sys.executable, str(ADW), "resume", str(run_dir), "--async",
+             "--approve"], cwd=ROOT)
+        final = json.loads((run_dir / "state.json").read_text())
+    _log("rate-limit", f"STUB-VERIFIED (real claude usage-limit line format).\n"
+         f"parked_ok={parked_ok} attempts={st['attempts']} "
+         f"stopped_because={st.get('stopped_because')}\n"
+         f"resume1 exit={r2.returncode} resume2 exit={r3.returncode}\n"
+         f"final status={final['status']}\n\n{out}")
+    ok = parked_ok and final["status"] == "done"
+    print(f"rate-limit: {'OK (stub-verified)' if ok else 'FAIL'} "
+          f"(parked no-retry={parked_ok}, final={final['status']})")
+    return ok
+
+
 SCENARIOS = {
     "demo": scenario_demo,
     "logic": scenario_logic,
     "crash-resume": scenario_crash_resume,
     "subscription": scenario_subscription,
+    "rate-limit": scenario_rate_limit,
 }
 
 
