@@ -1,0 +1,9 @@
+# Acceptance test for the tiny TUI (gli #9). panedrive drives real keys and
+# asserts on the JSON state seam. Exit 0 = all passed, 1 = an assert failed.
+type inc
+press Enter
+wait-until count=1 --timeout-ms 3000
+type inc
+press Enter
+wait-until count=2 --timeout-ms 3000
+assert last=inc

@@ -219,6 +219,36 @@ WORKFLOWS = {
         {"kind": "gate", "name": "lint",
          "cmd": ["ruff", "check", "."], "on_fail": "build", "max": 2},
     ],
+    # DEEP GATES (gli #9). The loop is only as honest as the gate is deep: a
+    # shallow gate certifies a mock. These drive the project for real.
+    #
+    # tui: a real browser for terminal UIs. panedrive presses real keys into the
+    # app in a PTY and asserts on its JSON state seam. The gate runs with
+    # cwd=workspace; panedrive's PTY child starts in $HOME, so the convention is
+    # $PWD-absolute paths (app.py + acceptance.pds + the .adw-tui.state.json seam
+    # in the repo root). Structured --json output feeds the thrash detector.
+    "tui": [
+        {"kind": "agent", "name": "build",
+         "prompt": "{task}\n\nImplement this terminal UI. Expose a paneview JSON "
+                   "state seam and keep acceptance.pds passing."},
+        {"kind": "gate", "name": "e2e", "on_fail": "build", "max": 3,
+         "cmd": ["sh", "-c",
+                 ('panedrive run "$PWD/acceptance.pds" --backend pty --json '
+                  '--state "$PWD/.adw-tui.state.json" -- '
+                  'python3 "$PWD/app.py" "$PWD/.adw-tui.state.json"')]},
+        {"kind": "human", "name": "review"},
+    ],
+    # sim: a deterministic, seeded simulation gate. `simharness assert` reads the
+    # project's simharness.config.ts and exits 0/1; its --json names the broken
+    # invariant, which the thrash detector reads as a shrinking signature.
+    "sim": [
+        {"kind": "agent", "name": "build",
+         "prompt": "{task}\n\nImplement this against the SimAdapter so "
+                   "simharness assert passes."},
+        {"kind": "gate", "name": "sim",
+         "cmd": ["simharness", "assert"], "on_fail": "build", "max": 3},
+        {"kind": "human", "name": "review"},
+    ],
     # An LLM reviewing the agent's diff - as a GATE, not a new step kind.
     # The judge's exit code is the routing and its stdout is the feedback, so
     # "one agent hands work to another" needs no machinery beyond what a
