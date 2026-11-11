@@ -435,6 +435,43 @@ def drop_worktree(state: dict, keep: bool) -> None:
 # THE NONDETERMINISTIC WORKER
 # ---------------------------------------------------------------------------
 
+# The distinctive line Claude Code prints when a Max/Pro subscription hits its
+# usage limit, optionally followed by |<reset-epoch>. Keyed on the FULL phrase so
+# a worker that is merely *building* a rate-limiter never trips this.
+USAGE_LIMIT_RE = re.compile(r"Claude AI usage limit reached(?:\|(\d+))?", re.IGNORECASE)
+
+
+def rate_limit_reset(text: str):
+    """(hit, reset_epoch|None) for the subscription usage-limit signal in text."""
+    m = USAGE_LIMIT_RE.search(text or "")
+    if m:
+        return True, (int(m.group(1)) if m.group(1) else None)
+    return False, None
+
+
+def result_rate_limited(result: dict):
+    """A usage/rate limit surfaced in a parsed result event (subscription or a
+    429 under an API key). Returns (hit, reset_epoch|None)."""
+    if not isinstance(result, dict):
+        return False, None
+    sub = str(result.get("subtype", "")).lower()
+    if "usage_limit" in sub or "rate_limit" in sub or "rate limit" in sub:
+        return True, None
+    api = result.get("api_error_status")
+    if api in (429, "429") or (isinstance(api, str) and "limit" in api.lower()):
+        return True, None
+    return rate_limit_reset(str(result.get("result", "")))
+
+
+def rate_limit_reason(result: dict) -> str:
+    reset = result.get("reset_at")
+    when = ""
+    if reset:
+        when = (" - resume after "
+                + dt.datetime.fromtimestamp(reset).astimezone().isoformat(timespec="minutes"))
+    return "worker hit a usage/rate limit; parked without retry" + when
+
+
 def run_agent(prompt: str, state: dict, run_dir: Path, limits: dict) -> dict:
     """Run one attempt. Returns the worker's final `result` event ({} if the
     worker doesn't emit one), so the orchestrator can tell a clean stop from
@@ -452,6 +489,7 @@ def run_agent(prompt: str, state: dict, run_dir: Path, limits: dict) -> dict:
     cmd = [a.replace("{prompt}", prompt) for a in cmd]
 
     result = {}
+    rl_hit, rl_reset = False, None
     with (run_dir / "events.jsonl").open("a") as events:
         events.write(json.dumps({
             "type": "adw.agent_start",
@@ -486,6 +524,8 @@ def run_agent(prompt: str, state: dict, run_dir: Path, limits: dict) -> dict:
                 break
             events.write(scrub(line if line.endswith("\n") else line + "\n"))
             events.flush()
+            if not rl_hit:                       # earliest reset epoch wins
+                rl_hit, rl_reset = rate_limit_reset(line)
             if spec["stream"] == "claude-json":
                 event = _narrate(line, state, run_dir)
                 if event.get("type") == "result":
@@ -493,6 +533,16 @@ def run_agent(prompt: str, state: dict, run_dir: Path, limits: dict) -> dict:
             else:
                 print(f"     {line.rstrip()[:100]}")
         proc.wait()
+
+    # A usage/rate limit is a clean, resumable stop - never a crash, and the
+    # orchestrator must park it WITHOUT retrying into the wall. Detect it from
+    # the raw stream (the subscription line) or a structured result (a 429),
+    # synthesise a distinct result, and skip the crash path on a non-zero exit.
+    if not rl_hit:
+        rl_hit, rl_reset = result_rate_limited(result)
+    if rl_hit:
+        return {**result, "is_error": True, "subtype": "usage_limit",
+                "rate_limited": True, "reset_at": rl_reset}
 
     # A worker that reported why it stopped isn't a crash - the caller decides
     # what to do about it. Only an unexplained non-zero exit is fatal.
@@ -710,6 +760,11 @@ def orchestrate(state: dict, steps: list, run_dir: Path, limits: dict) -> dict:
             # than a commit labelled with the attempt that made them.
             sha = snapshot(state, f"{step['name']} attempt {n}")
             print(f"     [commit] {sha or 'no changes'}")
+            if result.get("rate_limited"):
+                # Park, do NOT loop back: retrying only hits the same wall.
+                return _park(state, run_dir, rate_limit_reason(result),
+                             {"actions": ["resume", "reject"],
+                              "reset_at": result.get("reset_at")})
             if result.get("is_error"):
                 return _stop(state, run_dir,
                              f"worker stopped: {result.get('subtype', 'unknown')}")
@@ -727,6 +782,11 @@ def orchestrate(state: dict, steps: list, run_dir: Path, limits: dict) -> dict:
             except (RuntimeError, OSError) as exc:
                 snapshot(state, f"{step['name']} attempt {n} (worker failed)")
                 return _stop(state, run_dir, f"worker failed: {exc}")
+            if result.get("rate_limited"):
+                snapshot(state, f"{step['name']} attempt {n}")
+                return _park(state, run_dir, rate_limit_reason(result),
+                             {"actions": ["resume", "reject"],
+                              "reset_at": result.get("reset_at")})
             if result.get("is_error"):
                 snapshot(state, f"{step['name']} attempt {n}")
                 return _stop(state, run_dir,
