@@ -1162,20 +1162,43 @@ def cmd_show(args) -> int:
     return 0
 
 
+def _node_id(name: str) -> str:
+    """mermaid node ids must be identifier-safe; spliced names like `do.m1` have
+    dots that break the parser. Sanitise the id, keep the real name as the label."""
+    return re.sub(r"\W", "_", name)
+
+
 def cmd_graph(args) -> int:
-    """Your workflow as a mermaid diagram - boxes for agents, diamonds for gates."""
-    steps = WORKFLOWS[args.workflow]
+    """A workflow as a mermaid diagram - boxes for agent/plan/interview, diamonds
+    for gates, circles for human review. Given a RUN DIR instead of a workflow
+    name, graph its persisted effective steps, so the spliced milestones of a real
+    long run show up, not just the static template."""
+    target = args.target
+    run_state = Path(target) / "state.json"
+    if run_state.exists():
+        steps = migrate(json.loads(run_state.read_text()))["steps"]
+        print(f"%% {Path(target).name} (effective steps)")
+    elif target in WORKFLOWS:
+        steps = WORKFLOWS[target]
+    else:
+        print(f"no workflow or run named {target!r}; "
+              f"workflows: {', '.join(WORKFLOWS)}")
+        return 2
+
     print("flowchart LR")
     for i, s in enumerate(steps):
-        shape = (f'  {s["name"]}[{s["name"]}]' if s["kind"] == "agent"
-                 else f'  {s["name"]}{{{s["name"]}}}' if s["kind"] == "gate"
-                 else f'  {s["name"]}(({s["name"]}))')
-        print(shape)
+        nid, name, kind = _node_id(s["name"]), s["name"], s["kind"]
+        if kind == "gate":
+            print(f'  {nid}{{{name}}}')          # diamond
+        elif kind == "human":
+            print(f'  {nid}(({name}))')          # circle
+        else:                                     # agent, plan, interview
+            print(f'  {nid}[{name}]')            # box
         if i + 1 < len(steps):
-            label = "|pass|" if s["kind"] == "gate" else ""
-            print(f'  {s["name"]} -->{label} {steps[i + 1]["name"]}')
+            label = "|pass|" if kind == "gate" else ""
+            print(f'  {nid} -->{label} {_node_id(steps[i + 1]["name"])}')
         if s.get("on_fail"):
-            print(f'  {s["name"]} -->|fail| {s["on_fail"]}')
+            print(f'  {nid} -->|fail| {_node_id(s["on_fail"])}')
     return 0
 
 
@@ -1361,7 +1384,8 @@ def main() -> int:
     sub.add_parser("list").set_defaults(func=cmd_list)
 
     g = sub.add_parser("graph")
-    g.add_argument("workflow", choices=list(WORKFLOWS))
+    g.add_argument("target", help="a workflow name, or a run dir to graph its "
+                                  "actual (spliced) steps")
     g.set_defaults(func=cmd_graph)
 
     args = ap.parse_args()
