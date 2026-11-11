@@ -351,6 +351,7 @@ def migrate(state: dict) -> dict:
     state.setdefault("origin_repo", ws)
     state.setdefault("head", head(ws))
     state.setdefault("base", state["head"])
+    state.setdefault("turns", 0)
     # The effective step list is the source of truth for resume. Older runs
     # (and runs that never spliced) are backfilled from the static template, so
     # a resume always has a list that contains state["step"] - including any
@@ -490,7 +491,8 @@ def run_agent(prompt: str, state: dict, run_dir: Path, limits: dict) -> dict:
 
     result = {}
     rl_hit, rl_reset = False, None
-    with (run_dir / "events.jsonl").open("a") as events:
+    turns_seen = 0                               # assistant turns, for workers
+    with (run_dir / "events.jsonl").open("a") as events:  # that report no count
         events.write(json.dumps({
             "type": "adw.agent_start",
             "at": stamp(),
@@ -530,9 +532,16 @@ def run_agent(prompt: str, state: dict, run_dir: Path, limits: dict) -> dict:
                 event = _narrate(line, state, run_dir)
                 if event.get("type") == "result":
                     result = event
+                elif event.get("type") == "assistant":
+                    turns_seen += 1
             else:
                 print(f"     {line.rstrip()[:100]}")
         proc.wait()
+
+    # Count model turns for the run-level ceiling. The subscription worker's
+    # result reports num_turns directly; stream workers that don't get the
+    # assistant-message count as a stand-in. Either way it feeds max_turns.
+    state["turns"] = state.get("turns", 0) + (result.get("num_turns") or turns_seen)
 
     # A usage/rate limit is a clean, resumable stop - never a crash, and the
     # orchestrator must park it WITHOUT retrying into the wall. Detect it from
@@ -658,6 +667,27 @@ def run_human(state: dict, limits: dict) -> str:
 
 
 # ---------------------------------------------------------------------------
+# CIRCUIT BREAKERS
+# ---------------------------------------------------------------------------
+
+def breaker(state: dict, limits: dict, started: float):
+    """The run-level ceilings, checked before every step. Returns a stop reason
+    or None. A run can overshoot by at most one step - the same contract the
+    cost ceiling always had. max_cost bounds metered workers; max_turns is the
+    ceiling that actually bites under a subscription, where cost_usd is blind.
+    """
+    if state["cost_usd"] > limits["max_cost"]:
+        return (f"over budget (${state['cost_usd']:.2f} > "
+                f"${limits['max_cost']:.2f})")
+    max_turns = limits.get("max_turns")
+    if max_turns is not None and state.get("turns", 0) > max_turns:
+        return f"over turn ceiling ({state.get('turns', 0)} > {max_turns})"
+    if time.time() - started > limits["max_wall"]:
+        return "over wall-clock limit"
+    return None
+
+
+# ---------------------------------------------------------------------------
 # DYNAMIC STEP EMISSION (the plan step)
 #
 # A plan step decomposes {task} into milestones and splices a gated step pair
@@ -725,11 +755,9 @@ def orchestrate(state: dict, steps: list, run_dir: Path, limits: dict) -> dict:
 
     while state["status"] == "running":
         # --- circuit breakers, checked before every step -------------------
-        if state["cost_usd"] > limits["max_cost"]:
-            return _stop(state, run_dir, "over budget "
-                         f"(${state['cost_usd']:.2f} > ${limits['max_cost']:.2f})")
-        if time.time() - started > limits["max_wall"]:
-            return _stop(state, run_dir, "over wall-clock limit")
+        tripped = breaker(state, limits, started)
+        if tripped:
+            return _stop(state, run_dir, tripped)
 
         step = by_name[state["step"]]
         # Counts every execution of this step, for the whole run. It used to
@@ -984,6 +1012,7 @@ def _limits(args) -> dict:
     return {
         "max_cost": args.max_cost,
         "max_wall": args.max_wall * 60,
+        "max_turns": args.max_turns,
         "max_attempt_cost": args.max_attempt_cost,
         "auto_approve": args.auto_approve,
         # Park human gates instead of prompting, even with a tty attached. The
@@ -1027,6 +1056,7 @@ def cmd_run(args) -> int:
         "origin_repo": str(repo), "base": head(workspace), "head": head(workspace),
         "step": steps[0]["name"], "status": "running", "attempts": {},
         "gate_hashes": {}, "cost_usd": 0.0, "feedback": None, "stream_types": {},
+        "turns": 0,
         "started_at": stamp(),
         "history": [],
         # The effective step list, persisted so a resumed run - including one a
@@ -1115,6 +1145,9 @@ def main() -> int:
     def budget(p):
         p.add_argument("--max-cost", type=float, default=5.0, help="USD ceiling")
         p.add_argument("--max-wall", type=float, default=30, help="minutes")
+        p.add_argument("--max-turns", type=int, default=1000,
+                       help="ceiling on total worker turns - the bound that "
+                            "bites under a subscription, where cost is blind")
         p.add_argument("--max-attempt-cost", type=float, default=1.0,
                        help="USD ceiling for a single agent attempt")
         p.add_argument("--auto-approve", action="store_true",

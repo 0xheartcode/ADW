@@ -226,12 +226,36 @@ def scenario_rate_limit() -> bool:
     return ok
 
 
+def scenario_ceiling() -> bool:
+    """#8: the real CLI parks at the turn ceiling (demo gate retries build 3x)."""
+    _banner("ceiling")
+    repo = _fresh("ceiling")
+    _git_init(repo)
+    (repo / "seed.txt").write_text("seed\n")
+    _commit(repo)
+    r = _sh([sys.executable, str(ADW), "run", "ceiling-proof", "--workflow", "demo",
+             "--worker", "demo", "--repo", str(repo), "--async",
+             "--max-turns", "2"], cwd=ROOT)
+    out = r.stdout + r.stderr
+    run_dir = max(Path(ROOT, "runs").glob("*ceiling-proof*"),
+                  key=lambda p: p.stat().st_mtime)
+    st = json.loads((run_dir / "state.json").read_text())
+    _log("ceiling", f"status={st['status']} turns={st.get('turns')} "
+         f"stopped_because={st.get('stopped_because')}\n\n{out}")
+    ok = (st["status"] == "parked" and "turn ceiling" in st.get("stopped_because", "")
+          and st.get("turns", 0) > 2)
+    print(f"ceiling: {'OK' if ok else 'FAIL'} "
+          f"(status={st['status']}, turns={st.get('turns')})")
+    return ok
+
+
 SCENARIOS = {
     "demo": scenario_demo,
     "logic": scenario_logic,
     "crash-resume": scenario_crash_resume,
     "subscription": scenario_subscription,
     "rate-limit": scenario_rate_limit,
+    "ceiling": scenario_ceiling,
 }
 
 
