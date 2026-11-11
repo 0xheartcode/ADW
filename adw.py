@@ -1067,16 +1067,47 @@ def _advance(state, step, order, run_dir) -> None:
         print("\nDONE")
 
 
+def classify_park(why: str) -> str:
+    """Group a park reason into a small taxonomy, for filtering and reporting."""
+    w = why.lower()
+    if "rate limit" in w or "usage" in w:
+        return "rate-limit"
+    if "not converging" in w or "identically twice" in w:
+        return "thrash"
+    if "plan" in w and ("reject" in w or "valid plan" in w or "unusable" in w):
+        return "bad-plan"
+    if "budget" in w or "ceiling" in w or "wall-clock" in w:
+        return "breaker"
+    if "awaiting review" in w:
+        return "review"
+    if "interview needs" in w:
+        return "interview"
+    if "worker" in w:
+        return "worker"
+    return "other"
+
+
+def resume_hint(run_dir: Path, pending: dict) -> str:
+    """The exact copy-paste command that unblocks this park."""
+    actions = pending.get("actions", [])
+    flag = " --approve" if "approve" in actions else ""
+    return f"adw.py resume {run_dir}{flag}"
+
+
 def _park(state, run_dir, why, pending) -> dict:
-    """Every non-green ending lands here: a clean stop with a reason and the
-    concrete decision that would unblock it, recorded in state.json. The run is
-    resumable; the butler reads `stopped_because` + `pending` to ask a human."""
+    """Every non-green ending lands here: a clean stop with a reason, the concrete
+    decision that would unblock it, and a copy-paste resume command, all recorded
+    in state.json. The run is resumable; the butler reads stopped_because +
+    pending + park_kind to ask a human (or file an issue)."""
     state["status"] = "parked"
     state["stopped_because"] = why
     state["pending"] = pending
+    state["park_kind"] = classify_park(why)
     state["ended_at"] = stamp()
     save_state(state, run_dir)
-    print(f"\nPARKED: {why}  (actions: {', '.join(pending['actions'])})")
+    print(f"\nPARKED [{state['park_kind']}]: {why}")
+    print(f"  actions: {', '.join(pending['actions'])}")
+    print(f"  resume:  {resume_hint(run_dir, pending)}")
     return state
 
 
@@ -1099,15 +1130,19 @@ def _stop(state, run_dir, why) -> dict:
 # INTROSPECTION
 # ---------------------------------------------------------------------------
 
-def cmd_list(_) -> int:
+def cmd_list(args) -> int:
     if not INDEX.exists():
         print("no runs yet")
         return 0
+    want = getattr(args, "park_kind", None)
     for line in INDEX.read_text().splitlines():
         r = json.loads(line)
+        if want and r.get("park_kind") != want:
+            continue
         mark = {"done": "ok  ", "failed": "FAIL",
                 "parked": "PARK"}.get(r["status"], "??  ")
-        print(f"{mark} ${r['cost_usd']:>6.2f}  {r['run']:<44} {r['task'][:50]}")
+        pk = f"  [{r['park_kind']}]" if r.get("park_kind") else ""
+        print(f"{mark} ${r['cost_usd']:>6.2f}  {r['run']:<44} {r['task'][:40]}{pk}")
     return 0
 
 
@@ -1329,6 +1364,9 @@ def _index(state: dict) -> None:
     run once per resume, each with a different verdict."""
     RUNS_DIR.mkdir(exist_ok=True)
     row = {k: state[k] for k in ("run", "task", "status", "cost_usd", "workflow")}
+    row["turns"] = state.get("turns", 0)
+    if state.get("park_kind"):
+        row["park_kind"] = state["park_kind"]
     rows = []
     if INDEX.exists():
         rows = [json.loads(l) for l in INDEX.read_text().splitlines() if l.strip()]
@@ -1381,7 +1419,11 @@ def main() -> int:
     w.add_argument("--tools", action="store_true", help="include tool calls")
     w.set_defaults(func=cmd_show)
 
-    sub.add_parser("list").set_defaults(func=cmd_list)
+    lst = sub.add_parser("list")
+    lst.add_argument("--park-kind", dest="park_kind",
+                     help="show only parked runs of this kind "
+                          "(breaker|rate-limit|thrash|bad-plan|review|worker|interview)")
+    lst.set_defaults(func=cmd_list)
 
     g = sub.add_parser("graph")
     g.add_argument("target", help="a workflow name, or a run dir to graph its "
