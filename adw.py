@@ -31,6 +31,8 @@ import sys
 import time
 from pathlib import Path
 
+__version__ = "0.1.0"
+
 HERE = Path(__file__).resolve().parent
 RUNS_DIR = Path("runs")
 INDEX = RUNS_DIR / "index.jsonl"
@@ -606,6 +608,46 @@ def rate_limit_reason(result: dict) -> str:
     return "worker hit a usage/rate limit; parked without retry" + when
 
 
+def _pump_agent_stream(proc, events, spec: dict, state: dict, run_dir: Path):
+    """Read the worker's output to EOF (or AGENT_TIMEOUT), logging every line.
+
+    `for line in proc.stdout` blocks in the iterator, so the old
+    proc.wait(timeout=...) after the loop could never fire and a silent worker
+    hung forever. Poll with a deadline instead.
+
+    Returns (result, turns_seen, rl_hit, rl_reset): the final `result` event
+    ({} if none), the assistant-turn count (a stand-in count for workers that
+    report no num_turns), and the earliest rate-limit signal seen in the stream.
+    """
+    result = {}
+    rl_hit, rl_reset = False, None
+    turns_seen = 0
+    deadline = time.time() + AGENT_TIMEOUT
+    while True:
+        left = deadline - time.time()
+        if left <= 0:
+            proc.kill()
+            raise RuntimeError(f"worker exceeded AGENT_TIMEOUT ({AGENT_TIMEOUT}s)")
+        if not select.select([proc.stdout], [], [], min(left, 5.0))[0]:
+            continue
+        line = proc.stdout.readline()
+        if not line:
+            break
+        events.write(scrub(line if line.endswith("\n") else line + "\n"))
+        events.flush()
+        if not rl_hit:                           # earliest reset epoch wins
+            rl_hit, rl_reset = rate_limit_reset(line)
+        if spec["stream"] == "claude-json":
+            event = _narrate(line, state, run_dir)
+            if event.get("type") == "result":
+                result = event
+            elif event.get("type") == "assistant":
+                turns_seen += 1
+        else:
+            print(f"     {line.rstrip()[:100]}")
+    return result, turns_seen, rl_hit, rl_reset
+
+
 def run_agent(prompt: str, state: dict, run_dir: Path, limits: dict) -> dict:
     """Run one attempt. Returns the worker's final `result` event ({} if the
     worker doesn't emit one), so the orchestrator can tell a clean stop from
@@ -622,10 +664,7 @@ def run_agent(prompt: str, state: dict, run_dir: Path, limits: dict) -> dict:
     cmd = [a.replace("{budget}", f"{cap:.4f}") for a in spec["cmd"]]
     cmd = [a.replace("{prompt}", prompt) for a in cmd]
 
-    result = {}
-    rl_hit, rl_reset = False, None
-    turns_seen = 0                               # assistant turns, for workers
-    with (run_dir / "events.jsonl").open("a") as events:  # that report no count
+    with (run_dir / "events.jsonl").open("a") as events:
         events.write(json.dumps({
             "type": "adw.agent_start",
             "at": stamp(),
@@ -642,33 +681,8 @@ def run_agent(prompt: str, state: dict, run_dir: Path, limits: dict) -> dict:
             # human gate is about to ask for.
             stdin=subprocess.DEVNULL,
         )
-
-        # `for line in proc.stdout` blocks in the iterator, so the old
-        # proc.wait(timeout=...) after the loop could never fire and a silent
-        # worker hung forever. Poll with a deadline instead.
-        deadline = time.time() + AGENT_TIMEOUT
-        while True:
-            left = deadline - time.time()
-            if left <= 0:
-                proc.kill()
-                raise RuntimeError(f"worker exceeded AGENT_TIMEOUT ({AGENT_TIMEOUT}s)")
-            if not select.select([proc.stdout], [], [], min(left, 5.0))[0]:
-                continue
-            line = proc.stdout.readline()
-            if not line:
-                break
-            events.write(scrub(line if line.endswith("\n") else line + "\n"))
-            events.flush()
-            if not rl_hit:                       # earliest reset epoch wins
-                rl_hit, rl_reset = rate_limit_reset(line)
-            if spec["stream"] == "claude-json":
-                event = _narrate(line, state, run_dir)
-                if event.get("type") == "result":
-                    result = event
-                elif event.get("type") == "assistant":
-                    turns_seen += 1
-            else:
-                print(f"     {line.rstrip()[:100]}")
+        result, turns_seen, rl_hit, rl_reset = _pump_agent_stream(
+            proc, events, spec, state, run_dir)
         proc.wait()
 
     # Count model turns for the run-level ceiling. The subscription worker's
@@ -929,13 +943,167 @@ def read_plan(state: dict, run_dir: Path) -> list:
 # Everything above is plumbing; this is the control flow.
 # ---------------------------------------------------------------------------
 
+def _run_worker_step(state: dict, step: dict, run_dir: Path, limits: dict, n: int):
+    """The worker-invoke preamble shared by agent and plan steps: build the
+    prompt (a retry is the same prompt plus the reason it failed), run one
+    attempt, and turn a worker crash into a clean stop (not a traceback that
+    leaves state.json saying "running").
+
+    Returns (result, terminal): terminal is a finished state to return, or
+    None to keep going with `result`.
+    """
+    prompt = step["prompt"].format(task=state["task"])
+    if state["feedback"]:
+        # THE important line. A retry is not a re-roll of the same prompt - it
+        # is the same prompt plus the reason the previous attempt failed.
+        prompt += f"\n\nThe previous attempt failed:\n{state['feedback']}"
+        state["feedback"] = None
+    try:
+        return run_agent(prompt, state, run_dir, limits), None
+    except (RuntimeError, OSError) as exc:
+        snapshot(state, f"{step['name']} attempt {n} (worker failed)")
+        return None, _stop(state, run_dir, f"worker failed: {exc}")
+
+
+def _step_agent(state, step, order, run_dir, limits, n):
+    result, terminal = _run_worker_step(state, step, run_dir, limits, n)
+    if terminal:
+        return terminal
+    # Commit before deciding anything: a worker that stopped early still leaves
+    # work on disk, and unattributed changes are worse than a commit labelled
+    # with the attempt that made them.
+    sha = snapshot(state, f"{step['name']} attempt {n}")
+    print(f"     [commit] {sha or 'no changes'}")
+    if result.get("rate_limited"):
+        # Park, do NOT loop back: retrying only hits the same wall.
+        return _park(state, run_dir, rate_limit_reason(result),
+                     {"actions": ["resume", "reject"],
+                      "reset_at": result.get("reset_at")})
+    if result.get("is_error"):
+        return _stop(state, run_dir,
+                     f"worker stopped: {result.get('subtype', 'unknown')}")
+    _advance(state, step, order, run_dir)
+    return None
+
+
+def _step_plan(state, step, steps, order, run_dir, limits, n):
+    """An agent step that EMITS steps. Same retry-with-feedback contract as a
+    normal agent; its product (plan.json) is then validated and spliced in."""
+    result, terminal = _run_worker_step(state, step, run_dir, limits, n)
+    if terminal:
+        return terminal
+    if result.get("rate_limited"):
+        snapshot(state, f"{step['name']} attempt {n}")
+        return _park(state, run_dir, rate_limit_reason(result),
+                     {"actions": ["resume", "reject"],
+                      "reset_at": result.get("reset_at")})
+    if result.get("is_error"):
+        snapshot(state, f"{step['name']} attempt {n}")
+        return _stop(state, run_dir,
+                     f"worker stopped: {result.get('subtype', 'unknown')}")
+    # Read+move plan.json BEFORE the snapshot so it never hits the diff. The
+    # plan is UNTRUSTED, so run it through the same validate() every static
+    # workflow passes; a bad plan is handled like a failed gate.
+    try:
+        milestones = read_plan(state, run_dir)
+        new_steps = expand_milestones(milestones)
+        errs = validate(steps + new_steps, state["worker"])
+    except (OSError, json.JSONDecodeError, KeyError,
+            TypeError, ValueError) as exc:
+        milestones, new_steps, errs = None, None, [f"{PLAN_FILE} unusable: {exc}"]
+    snapshot(state, f"{step['name']} attempt {n}")
+    if errs:
+        state["feedback"] = "plan rejected:\n" + "\n".join(errs)
+        if n >= step.get("max", 2):
+            return _stop(state, run_dir, "planner could not produce a valid plan")
+        return None                            # retry the plan step
+    i = order.index(step["name"])
+    steps[i + 1:i + 1] = new_steps             # splice into the live list...
+    state["steps"] = steps                     # ...which is state["steps"]
+    save_state(state, run_dir)
+    transition(state, new_steps[0]["name"], f"{len(milestones)} milestones", run_dir)
+    return None
+
+
+def _step_interview(state, step, order, run_dir, limits):
+    # Pin "done" as tests BEFORE any build: a human + an interactive agent
+    # co-write the acceptance criteria as runnable tests, which the normal
+    # gates then enforce. Needs a real keyboard - no TTY, or --async, must
+    # park (never silently skip). This is interactive (NOT -p). The
+    # ADW_INTERVIEW_CMD seam lets a driver/test stand in for `claude`.
+    if limits.get("noninteractive") or not sys.stdin.isatty():
+        return _stop(state, run_dir, "interview needs a human at the keyboard")
+    cmd = shlex.split(os.environ.get("ADW_INTERVIEW_CMD", "claude"))
+    cmd.append(step["prompt"].format(task=state["task"]))
+    subprocess.run(cmd, cwd=state["workspace"], check=False)
+    snapshot(state, "interview")               # commit the criteria for the gates
+    _advance(state, step, order, run_dir)
+    return None
+
+
+def _step_gate(state, step, order, run_dir, n):
+    passed, excerpt = run_gate(step, state, run_dir, n)
+    digest = hashlib.sha1(excerpt.encode()).hexdigest()[:12]
+
+    if passed:
+        _advance(state, step, order, run_dir)
+        return None
+    if step.get("on_fail") is None:
+        return _stop(state, run_dir, f"{step['name']} failed (no retry path)")
+
+    # Convergence check. The failure SIGNATURE (smaller = closer to passing,
+    # read from structured gate output when available) must keep shrinking. If
+    # it stops improving for thrash_window attempts the agent is thrashing -
+    # fails differently but no closer - and burning the rest of the budget buys
+    # nothing.
+    sig = failure_signature(excerpt)
+    th = state.setdefault("thrash", {}).setdefault(
+        step["name"], {"best": None, "stale": 0})
+    if th["best"] is None or sig < th["best"]:
+        th["best"], th["stale"] = sig, 0
+    else:
+        th["stale"] += 1
+
+    if state["gate_hashes"].get(step["name"]) == digest:
+        return _stop(state, run_dir, f"{step['name']} failed identically twice")
+    if th["stale"] >= step.get("thrash_window", 2):
+        return _stop(state, run_dir,
+                     f"{step['name']} not converging "
+                     f"(failure signature stuck at {th['best']})")
+    if n >= step["max"]:
+        return _stop(state, run_dir, f"{step['name']} exhausted {n} attempts")
+    state["gate_hashes"][step["name"]] = digest
+    state["feedback"] = excerpt
+    transition(state, step["on_fail"], f"{step['name']} failed", run_dir)
+    return None
+
+
+def _step_human(state, step, steps, order, run_dir, limits):
+    decision = run_human(state, limits)
+    if decision == "approve":
+        _advance(state, step, order, run_dir)
+        return None
+    if decision == "reject":
+        _reject(state, steps, run_dir, f"rejected at {step['name']}")
+        return None
+    # park - a human decides out-of-band
+    return _park(state, run_dir, f"awaiting review at '{step['name']}'",
+                 {"actions": ["approve", "reject"], "step": step["name"]})
+
+
 def orchestrate(state: dict, steps: list, run_dir: Path, limits: dict) -> dict:
-    by_name = {s["name"]: s for s in steps}
-    order = [s["name"] for s in steps]
+    """The control flow. A pointer into a list (state["step"]), a dict of
+    attempt counts, and a loop that dispatches each step to its kind's handler.
+    A handler returns a finished state to stop on, or None to keep looping."""
     started = time.time()
 
     while state["status"] == "running":
-        # --- circuit breakers, checked before every step -------------------
+        # by_name/order are recomputed each pass because a plan step splices
+        # new steps into `steps` mid-run.
+        by_name = {s["name"]: s for s in steps}
+        order = [s["name"] for s in steps]
+
+        # Circuit breakers, checked before every step.
         tripped = breaker(state, limits, started)
         if tripped:
             return _stop(state, run_dir, tripped)
@@ -950,142 +1118,20 @@ def orchestrate(state: dict, steps: list, run_dir: Path, limits: dict) -> dict:
         save_state(state, run_dir)
         print(f"\n[{step['name']}] attempt {n}")
 
-        if step["kind"] == "agent":
-            prompt = step["prompt"].format(task=state["task"])
-            if state["feedback"]:
-                # THE important line. A retry is not a re-roll of the same
-                # prompt - it is the same prompt plus the reason it failed.
-                prompt += f"\n\nThe previous attempt failed:\n{state['feedback']}"
-                state["feedback"] = None
-            try:
-                result = run_agent(prompt, state, run_dir, limits)
-            except (RuntimeError, OSError) as exc:
-                # A worker that won't start or won't finish is a stop, not a
-                # traceback: state.json must not be left saying "running".
-                snapshot(state, f"{step['name']} attempt {n} (worker failed)")
-                return _stop(state, run_dir, f"worker failed: {exc}")
-            # Commit before deciding anything: a worker that stopped early
-            # still leaves work on disk, and unattributed changes are worse
-            # than a commit labelled with the attempt that made them.
-            sha = snapshot(state, f"{step['name']} attempt {n}")
-            print(f"     [commit] {sha or 'no changes'}")
-            if result.get("rate_limited"):
-                # Park, do NOT loop back: retrying only hits the same wall.
-                return _park(state, run_dir, rate_limit_reason(result),
-                             {"actions": ["resume", "reject"],
-                              "reset_at": result.get("reset_at")})
-            if result.get("is_error"):
-                return _stop(state, run_dir,
-                             f"worker stopped: {result.get('subtype', 'unknown')}")
-            _advance(state, step, order, run_dir)
-
-        elif step["kind"] == "plan":
-            # An agent step that EMITS steps. Same retry-with-feedback contract
-            # as a normal agent; its product (plan.json) is then gated.
-            prompt = step["prompt"].format(task=state["task"])
-            if state["feedback"]:
-                prompt += f"\n\nThe previous attempt failed:\n{state['feedback']}"
-                state["feedback"] = None
-            try:
-                result = run_agent(prompt, state, run_dir, limits)
-            except (RuntimeError, OSError) as exc:
-                snapshot(state, f"{step['name']} attempt {n} (worker failed)")
-                return _stop(state, run_dir, f"worker failed: {exc}")
-            if result.get("rate_limited"):
-                snapshot(state, f"{step['name']} attempt {n}")
-                return _park(state, run_dir, rate_limit_reason(result),
-                             {"actions": ["resume", "reject"],
-                              "reset_at": result.get("reset_at")})
-            if result.get("is_error"):
-                snapshot(state, f"{step['name']} attempt {n}")
-                return _stop(state, run_dir,
-                             f"worker stopped: {result.get('subtype', 'unknown')}")
-            # Read+move plan.json BEFORE the snapshot so it never hits the diff.
-            # The plan is UNTRUSTED, so run it through the same validate() every
-            # static workflow passes; a bad plan is handled like a failed gate.
-            try:
-                milestones = read_plan(state, run_dir)
-                new_steps = expand_milestones(milestones)
-                errs = validate(steps + new_steps, state["worker"])
-            except (OSError, json.JSONDecodeError, KeyError,
-                    TypeError, ValueError) as exc:
-                milestones, new_steps, errs = None, None, [f"{PLAN_FILE} unusable: {exc}"]
-            snapshot(state, f"{step['name']} attempt {n}")
-            if errs:
-                state["feedback"] = "plan rejected:\n" + "\n".join(errs)
-                if n >= step.get("max", 2):
-                    return _stop(state, run_dir,
-                                 "planner could not produce a valid plan")
-                continue                       # retry the plan step
-            i = order.index(step["name"])
-            steps[i + 1:i + 1] = new_steps     # splice into the live list...
-            state["steps"] = steps             # ...which is state["steps"]
-            by_name = {s["name"]: s for s in steps}
-            order = [s["name"] for s in steps]
-            save_state(state, run_dir)
-            transition(state, new_steps[0]["name"],
-                       f"{len(milestones)} milestones", run_dir)
-
-        elif step["kind"] == "interview":
-            # Pin "done" as tests BEFORE any build: a human + an interactive agent
-            # co-write the acceptance criteria as runnable tests, which the normal
-            # gates then enforce. Needs a real keyboard - no TTY, or --async, must
-            # park (never silently skip). This is interactive (NOT -p). The
-            # ADW_INTERVIEW_CMD seam lets a driver/test stand in for `claude`.
-            if limits.get("noninteractive") or not sys.stdin.isatty():
-                return _stop(state, run_dir,
-                             "interview needs a human at the keyboard")
-            cmd = shlex.split(os.environ.get("ADW_INTERVIEW_CMD", "claude"))
-            cmd.append(step["prompt"].format(task=state["task"]))
-            subprocess.run(cmd, cwd=state["workspace"], check=False)
-            snapshot(state, "interview")         # commit the criteria for the gates
-            _advance(state, step, order, run_dir)
-
-        elif step["kind"] == "gate":
-            passed, excerpt = run_gate(step, state, run_dir, n)
-            digest = hashlib.sha1(excerpt.encode()).hexdigest()[:12]
-
-            if passed:
-                _advance(state, step, order, run_dir)
-            elif step.get("on_fail") is None:
-                return _stop(state, run_dir, f"{step['name']} failed (no retry path)")
-            else:
-                # Convergence check. The failure SIGNATURE (smaller = closer to
-                # passing, read from structured gate output when available) must
-                # keep shrinking. If it stops improving for thrash_window
-                # attempts the agent is thrashing - fails differently but no
-                # closer - and burning the rest of the budget buys nothing.
-                sig = failure_signature(excerpt)
-                th = state.setdefault("thrash", {}).setdefault(
-                    step["name"], {"best": None, "stale": 0})
-                if th["best"] is None or sig < th["best"]:
-                    th["best"], th["stale"] = sig, 0
-                else:
-                    th["stale"] += 1
-
-                if state["gate_hashes"].get(step["name"]) == digest:
-                    return _stop(state, run_dir,
-                                 f"{step['name']} failed identically twice")
-                if th["stale"] >= step.get("thrash_window", 2):
-                    return _stop(state, run_dir,
-                                 f"{step['name']} not converging "
-                                 f"(failure signature stuck at {th['best']})")
-                if n >= step["max"]:
-                    return _stop(state, run_dir,
-                                 f"{step['name']} exhausted {n} attempts")
-                state["gate_hashes"][step["name"]] = digest
-                state["feedback"] = excerpt
-                transition(state, step["on_fail"], f"{step['name']} failed", run_dir)
-
+        kind = step["kind"]
+        if kind == "agent":
+            done = _step_agent(state, step, order, run_dir, limits, n)
+        elif kind == "plan":
+            done = _step_plan(state, step, steps, order, run_dir, limits, n)
+        elif kind == "interview":
+            done = _step_interview(state, step, order, run_dir, limits)
+        elif kind == "gate":
+            done = _step_gate(state, step, order, run_dir, n)
         else:  # human
-            decision = run_human(state, limits)
-            if decision == "approve":
-                _advance(state, step, order, run_dir)
-            elif decision == "reject":
-                _reject(state, steps, run_dir, f"rejected at {step['name']}")
-            else:  # park - a human decides out-of-band
-                return _park(state, run_dir, f"awaiting review at '{step['name']}'",
-                             {"actions": ["approve", "reject"], "step": step["name"]})
+            done = _step_human(state, step, steps, order, run_dir, limits)
+
+        if done:
+            return done
 
     return state
 
@@ -1536,6 +1582,7 @@ def _index(state: dict) -> None:
 
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__)
+    ap.add_argument("--version", action="version", version=f"adw {__version__}")
     sub = ap.add_subparsers(dest="cmd", required=True)
 
     def budget(p):
