@@ -1,4 +1,4 @@
-"""#8 — turn/wall ceilings (the dollar ceiling is blind under a subscription)."""
+"""#8 - turn/wall ceilings (the dollar ceiling is blind under a subscription)."""
 import time
 
 from helpers import git_repo, limits, make_run, register_stub, write_stub_worker

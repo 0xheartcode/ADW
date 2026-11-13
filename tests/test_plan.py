@@ -1,4 +1,4 @@
-"""#1 — plan step: dynamic step emission and splice."""
+"""#1 - plan step: dynamic step emission and splice."""
 import pytest
 from helpers import (
     RESULT_OK,

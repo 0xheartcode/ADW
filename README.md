@@ -21,7 +21,12 @@ Single file, zero third-party dependencies, stdlib only.
 cd ADW
 cp .env.example .env          # only needed for the local-endpoint worker
 just demo                     # free, offline, no LLM - proves the loop works
+just tutorial                 # the same run, narrated step by step
 ```
+
+New here? `just tutorial` is a guided first run: it drives the free `demo`
+workflow against a throwaway repo and explains what to watch for as it goes.
+`just tutorial-interview` is the same, but you answer the human review gate.
 
 Then, on a real repo with a clean tree:
 
@@ -407,5 +412,16 @@ just test     # check + both demo flows. Costs nothing.
 `demo/` holds a fake worker and fake gates. Every retry path, breaker and
 counter was verified through them, without paying an LLM and without
 nondeterminism getting in the way.
+
+Two tiers of tests back this up:
+
+```bash
+just test-py  # fast, hermetic pytest suite (does the code behave?)
+just e2e      # real adw.py runs against throwaway sandboxes (does the tool work end to end?)
+```
+
+`e2e/` is also the best set of worked examples: each scenario builds a fresh
+sandbox project (Rust, a PTY TUI, a seeded sim, a crashing run) and drives a
+real `adw.py` run against it. `e2e/README.md` indexes them.
 
 See `HANDOVER.md` for design constraints and what is deliberately out of scope.

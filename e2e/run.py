@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
 """Dogfood harness: build throwaway sandboxes and drive REAL adw.py runs.
 
-Usage: python dogfood/run.py <scenario|all>
+Usage: python e2e/run.py <scenario|all>
 
 Scenarios are added as issues land. Each returns True on success. Logs go to
-dogfood/logs/<scenario>.log and are referenced from commit bodies / gli notes.
-Stdlib only, like adw.py — no third-party imports here either.
+e2e/logs/<scenario>.log and are referenced from commit bodies / gli notes.
+Stdlib only, like adw.py - no third-party imports here either.
 """
 import json
 import os
@@ -18,8 +18,8 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
 ADW = ROOT / "adw.py"
-TMP = ROOT / "dogfood" / "tmp"
-LOGS = ROOT / "dogfood" / "logs"
+TMP = ROOT / "e2e" / "tmp"
+LOGS = ROOT / "e2e" / "logs"
 
 
 def _sh(cmd, cwd=None, env=None, timeout=300):
@@ -30,8 +30,8 @@ def _sh(cmd, cwd=None, env=None, timeout=300):
 def _git_init(repo: Path):
     repo.mkdir(parents=True, exist_ok=True)
     _sh(["git", "init", "-q", "."], cwd=repo)
-    _sh(["git", "config", "user.email", "dogfood@adw"], cwd=repo)
-    _sh(["git", "config", "user.name", "dogfood"], cwd=repo)
+    _sh(["git", "config", "user.email", "e2e@adw"], cwd=repo)
+    _sh(["git", "config", "user.name", "e2e"], cwd=repo)
 
 
 def _commit(repo: Path, msg="init"):
@@ -53,7 +53,7 @@ def _log(name: str, text: str):
 
 
 def _banner(name):
-    print(f"\n=== dogfood: {name} ===")
+    print(f"\n=== e2e: {name} ===")
 
 
 # --------------------------------------------------------------------------
@@ -168,7 +168,7 @@ def scenario_subscription() -> bool:
     _banner("subscription")
     if os.environ.get("ADW_DOGFOOD_SUBSCRIPTION") != "1":
         print("subscription: SKIP (set ADW_DOGFOOD_SUBSCRIPTION=1 to run; "
-              "last real run recorded in dogfood/logs/subscription-worker.log)")
+              "last real run recorded in e2e/logs/subscription-worker.log)")
         return True
     if not shutil.which("claude"):
         print("subscription: SKIP (claude not on PATH)")
@@ -265,7 +265,7 @@ def scenario_interview() -> bool:
     _git_init(repo)
     (repo / "seed.txt").write_text("seed\n")
     _commit(repo)
-    pds = ROOT / "dogfood" / "scripts" / "interview.pds"
+    pds = ROOT / "e2e" / "scripts" / "interview.pds"
     stub = ROOT / "demo" / "interviewer_stub.py"
     env = {**os.environ, "ADW_INTERVIEW_CMD": f"{sys.executable} {stub}"}
     # Replay the recorded .pds against ADW's interview, in a real PTY. panedrive
@@ -301,7 +301,7 @@ def scenario_interview() -> bool:
     return ok
 
 
-FIX = ROOT / "dogfood" / "fixtures"
+FIX = ROOT / "e2e" / "fixtures"
 
 
 def _gate_exit(argv, cwd, env=None):
@@ -340,7 +340,7 @@ def scenario_paneview() -> bool:
     (repo / "seed.txt").write_text("seed\n")
     _commit(repo)
     seam = (TMP / "adw.seam.json")
-    pds = ROOT / "dogfood" / "scripts" / "adw-seam.pds"
+    pds = ROOT / "e2e" / "scripts" / "adw-seam.pds"
     child = (f"cd {ROOT} && exec {sys.executable} {ADW} run seamtask --workflow "
              f"demo --worker demo --repo {repo} --async")
     r = _sh([panedrive, "run", str(pds), "--backend", "pty", "--allow-exit",
@@ -479,7 +479,7 @@ def scenario_long() -> bool:
     _git_init(repo)
     (repo / "seed.txt").write_text("seed\n")
     _commit(repo)
-    pds = ROOT / "dogfood" / "scripts" / "long.pds"
+    pds = ROOT / "e2e" / "scripts" / "long.pds"
     stub = ROOT / "demo" / "interviewer_stub.py"
     env = {**os.environ, "ADW_INTERVIEW_CMD": f"{sys.executable} {stub}"}
     child = (f"cd {ROOT} && exec {sys.executable} {ADW} run longtask --workflow "
@@ -553,10 +553,10 @@ def main() -> int:
             return 2
         try:
             results[n] = fn()
-        except Exception as exc:  # noqa: BLE001 - dogfood must report, not crash
+        except Exception as exc:  # noqa: BLE001 - e2e must report, not crash
             print(f"{n}: EXCEPTION {exc}")
             results[n] = False
-    print("\n--- dogfood summary ---")
+    print("\n--- e2e summary ---")
     for n, ok in results.items():
         print(f"  {'PASS' if ok else 'FAIL'}  {n}")
     return 0 if all(results.values()) else 1

@@ -1,4 +1,4 @@
-"""#7 — thrash detector keyed on a shrinking structured failure signature."""
+"""#7 - thrash detector keyed on a shrinking structured failure signature."""
 import json
 
 from helpers import git_repo, limits, make_run

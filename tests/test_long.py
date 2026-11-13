@@ -1,4 +1,4 @@
-"""#6 — the long workflow: interview -> plan/splice -> milestones -> review."""
+"""#6 - the long workflow: interview -> plan/splice -> milestones -> review."""
 import json
 import os
 import pty
