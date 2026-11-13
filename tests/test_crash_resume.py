@@ -1,4 +1,4 @@
-"""#1/#2 — resume at EVERY step boundary of a spliced workflow (no KeyError,
+"""#1/#2 - resume at EVERY step boundary of a spliced workflow (no KeyError,
 no lost/duplicated steps). A crash can only leave two consistent shapes:
   - mid-plan: step=='plan', steps==[plan]      (splice+transition save together)
   - post-splice: step==do/ok/review, steps==spliced

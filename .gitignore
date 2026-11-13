@@ -4,8 +4,8 @@ __pycache__/
 *.pyc
 .aider*
 .venv/
-dogfood/tmp/
-dogfood/sandboxes/
+e2e/tmp/
+e2e/sandboxes/
 *.state.json
 
 # Internal working notes - LOCAL ONLY, never published (per owner instruction)
@@ -13,4 +13,4 @@ DECISIONS.md
 PROGRESS.md
 NEEDS_YOU.md
 PROPOSAL-long-horizon.md
-dogfood/logs/
+e2e/logs/

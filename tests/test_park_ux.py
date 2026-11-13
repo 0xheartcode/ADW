@@ -1,4 +1,4 @@
-"""#17 — park/resume UX: resume hints, a park-reason taxonomy, list filter."""
+"""#17 - park/resume UX: resume hints, a park-reason taxonomy, list filter."""
 import json
 from pathlib import Path
 from types import SimpleNamespace

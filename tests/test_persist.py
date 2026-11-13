@@ -1,4 +1,4 @@
-"""#2 — persist the effective step list so spliced steps survive resume."""
+"""#2 - persist the effective step list so spliced steps survive resume."""
 import copy
 import json
 

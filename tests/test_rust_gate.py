@@ -1,4 +1,4 @@
-"""#15 — csd Rust architectural deep gate + convergence signal."""
+"""#15 - csd Rust architectural deep gate + convergence signal."""
 import shutil
 
 

@@ -4,7 +4,7 @@ can drive it headlessly and assert on real state (gli #9, the deep TUI gate).
 
 Reads commands (one per line) from stdin, keeps a counter, and writes the seam
 {count,last,ready} atomically to the path in argv[1] after every change. This is
-the CORRECT version; the dogfood also builds a BROKEN copy to prove the gate can
+the CORRECT version; the e2e also builds a BROKEN copy to prove the gate can
 actually fail. Stdlib only.
 """
 import json

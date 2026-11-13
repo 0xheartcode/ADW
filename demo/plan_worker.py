@@ -6,7 +6,7 @@ Branch on the prompt, like a real worker would on intent:
 - anything else (a do.<id> step) -> write an attempt file, like demo/worker.py.
 
 Costs $0, fully deterministic. Set ADW_DEMO_SLEEP=<secs> to make the DO steps
-dawdle, so a dogfood run can kill the process mid-milestone and test resume.
+dawdle, so an e2e run can kill the process mid-milestone and test resume.
 Emits claude-shaped stream-json so run_agent/_narrate parse a clean result.
 """
 import json

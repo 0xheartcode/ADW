@@ -1,4 +1,4 @@
-"""#9 — deep-gate recipes (tui/sim) + the gate contract they rely on."""
+"""#9 - deep-gate recipes (tui/sim) + the gate contract they rely on."""
 import shutil
 
 from helpers import git_repo, make_run

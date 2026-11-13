@@ -1,4 +1,4 @@
-"""#5 — interview step: pin acceptance tests before build, at a real TTY."""
+"""#5 - interview step: pin acceptance tests before build, at a real TTY."""
 import os
 import pty
 import sys

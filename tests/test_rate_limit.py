@@ -1,9 +1,9 @@
-"""#4 — park cleanly on a usage/rate limit; never retry into the wall.
+"""#4 - park cleanly on a usage/rate limit; never retry into the wall.
 
 The subscription signal is the literal line `Claude AI usage limit reached|<epoch>`
 (verified against the real claude CLI's documented output). Live limits cannot be
 triggered safely, so the orchestration paths are exercised with a stub claude
-binary emitting that exact line -> labelled stub-verified in the dogfood log.
+binary emitting that exact line -> labelled stub-verified in the e2e log.
 """
 from helpers import (
     RESULT_OK,

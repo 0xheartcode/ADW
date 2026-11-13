@@ -32,7 +32,7 @@ def adw_mod():
 
 @pytest.fixture
 def git_repo(tmp_path):
-    """A tmp git repo with one commit — the minimum adw.py requires."""
+    """A tmp git repo with one commit - the minimum adw.py requires."""
     repo = tmp_path / "repo"
     repo.mkdir()
     (repo / "seed.txt").write_text("seed\n")

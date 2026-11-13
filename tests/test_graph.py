@@ -1,4 +1,4 @@
-"""#10 — graph renders a run's actual (spliced) steps, not just the template."""
+"""#10 - graph renders a run's actual (spliced) steps, not just the template."""
 from types import SimpleNamespace
 
 

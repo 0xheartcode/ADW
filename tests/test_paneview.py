@@ -1,4 +1,4 @@
-"""#11 — ADW exposes a paneview JSON seam so panedrive can drive/assert it."""
+"""#11 - ADW exposes a paneview JSON seam so panedrive can drive/assert it."""
 import json
 import shutil
 import subprocess

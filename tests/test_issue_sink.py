@@ -1,4 +1,4 @@
-"""#12 — gli as the butler issue sink: file on park, update, close on done."""
+"""#12 - gli as the butler issue sink: file on park, update, close on done."""
 import shutil
 import subprocess
 

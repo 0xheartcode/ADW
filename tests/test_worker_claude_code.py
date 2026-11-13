@@ -1,4 +1,4 @@
-"""#3 — claude-code subscription worker (no API key, no budget)."""
+"""#3 - claude-code subscription worker (no API key, no budget)."""
 import shutil
 
 import pytest
